@@ -110,60 +110,82 @@ function initSupabase() {
 
 // ----- Conversor de campos: camelCase ↔ snake_case --------------------------
 // Mapeamento de campos que precisam ser renomeados ao salvar/carregar.
+// allowed = lista das colunas que EXISTEM na tabela do Supabase.
+// Tudo fora dessa lista é IGNORADO ao salvar (mas continua em state em memória).
 const FIELD_MAPS = {
   empresa: {
+    allowed: ['id','razao_social','nome_fantasia','cnpj','ie','regime','faixa_simples','ncm_padrao','cfop_padrao','endereco','contato','nfe_serie','nfe_proximo_numero'],
     toDb:   { razaoSocial:'razao_social', nomeFantasia:'nome_fantasia', faixaSimples:'faixa_simples', ncmPadrao:'ncm_padrao', cfopPadrao:'cfop_padrao', nfeSerie:'nfe_serie', nfeProximoNumero:'nfe_proximo_numero' },
     fromDb: { razao_social:'razaoSocial', nome_fantasia:'nomeFantasia', faixa_simples:'faixaSimples', ncm_padrao:'ncmPadrao', cfop_padrao:'cfopPadrao', nfe_serie:'nfeSerie', nfe_proximo_numero:'nfeProximoNumero' }
   },
   markup: {
+    allowed: ['id','modo','df','dv','ml','producao_mensal','custo_fixo_mes','custo_variavel_mes','margem_liquida_mes'],
     toDb:   { producaoMensal:'producao_mensal', custoFixoMes:'custo_fixo_mes', custoVariavelMes:'custo_variavel_mes', margemLiquidaMes:'margem_liquida_mes' },
     fromDb: { producao_mensal:'producaoMensal', custo_fixo_mes:'custoFixoMes', custo_variavel_mes:'custoVariavelMes', margem_liquida_mes:'margemLiquidaMes' }
   },
   produtos: {
+    allowed: ['id','sku','nome','ncm','peso_liq','saldo_pa','minimo_pa'],
     toDb:   { pesoLiq:'peso_liq', saldoPa:'saldo_pa', minimoPa:'minimo_pa' },
     fromDb: { peso_liq:'pesoLiq', saldo_pa:'saldoPa', minimo_pa:'minimoPa' }
   },
   receitas: {
+    allowed: ['id','produto_id','ativa','rendimento_un','tempo_h','taxa_mod','depreciacao','itens'],
     toDb:   { produtoId:'produto_id', rendimentoUn:'rendimento_un', tempoH:'tempo_h', taxaMod:'taxa_mod' },
     fromDb: { produto_id:'produtoId', rendimento_un:'rendimentoUn', tempo_h:'tempoH', taxa_mod:'taxaMod' }
   },
   clientes: {
-    toDb:   { prazoDias:'prazo_dias' },
-    fromDb: { prazo_dias:'prazoDias' }
+    allowed: ['id','nome','tipo','telefone','email','cidade','uf','prazo_dias','documento','limite_credito','forma_pagto'],
+    toDb:   { prazoDias:'prazo_dias', limiteCredito:'limite_credito', formaPagto:'forma_pagto' },
+    fromDb: { prazo_dias:'prazoDias', limite_credito:'limiteCredito', forma_pagto:'formaPagto' }
   },
   fornecedores: {
-    toDb:   { leadTime:'lead_time' },
-    fromDb: { lead_time:'leadTime' }
+    allowed: ['id','nome','cnpj','telefone','email','origem','lead_time','score','preferencial','pedido_minimo','prazo_pagto'],
+    toDb:   { leadTime:'lead_time', pedidoMinimo:'pedido_minimo', prazoPagto:'prazo_pagto' },
+    fromDb: { lead_time:'leadTime', pedido_minimo:'pedidoMinimo', prazo_pagto:'prazoPagto' }
   },
   fornecedorInsumos: {
     table:  'fornecedor_insumos',
+    allowed: ['id','fornecedor_id','insumo_id','preco'],
     toDb:   { fornecedorId:'fornecedor_id', insumoId:'insumo_id' },
     fromDb: { fornecedor_id:'fornecedorId', insumo_id:'insumoId' }
   },
   movimentos: {
+    allowed: ['id','insumo_id','tipo','qtd','custo_unit','obs','data'],
     toDb:   { insumoId:'insumo_id', custoUnit:'custo_unit' },
     fromDb: { insumo_id:'insumoId', custo_unit:'custoUnit' }
   },
   pedidos: {
-    toDb:   { clienteId:'cliente_id', statusComercial:'status_comercial', statusProdutivo:'status_produtivo', criadoEm:'criado_em', dataEntrega:'data_entrega', custoSnapshot:'custo_snapshot' },
-    fromDb: { cliente_id:'clienteId', status_comercial:'statusComercial', status_produtivo:'statusProdutivo', criado_em:'criadoEm', data_entrega:'dataEntrega', custo_snapshot:'custoSnapshot' }
+    allowed: ['id','numero','tipo','cliente_id','canal','status_comercial','status_produtivo','criado_em','data_entrega','subtotal','total','bonificacao','custo_snapshot','itens','forma_pagto','prazo_dias'],
+    toDb:   { clienteId:'cliente_id', statusComercial:'status_comercial', statusProdutivo:'status_produtivo', criadoEm:'criado_em', dataEntrega:'data_entrega', custoSnapshot:'custo_snapshot', formaPagto:'forma_pagto', prazoDias:'prazo_dias' },
+    fromDb: { cliente_id:'clienteId', status_comercial:'statusComercial', status_produtivo:'statusProdutivo', criado_em:'criadoEm', data_entrega:'dataEntrega', custo_snapshot:'custoSnapshot', forma_pagto:'formaPagto', prazo_dias:'prazoDias' }
   },
   ordens: {
+    allowed: ['id','numero','produto_id','tamanho_lote','status','programada_para','iniciada_em','concluida_em','custo_total','custo_unitario','pedido_origem_id','fases'],
     toDb:   { produtoId:'produto_id', tamanhoLote:'tamanho_lote', programadaPara:'programada_para', iniciadaEm:'iniciada_em', concluidaEm:'concluida_em', custoTotal:'custo_total', custoUnitario:'custo_unitario', pedidoOrigemId:'pedido_origem_id' },
     fromDb: { produto_id:'produtoId', tamanho_lote:'tamanhoLote', programada_para:'programadaPara', iniciada_em:'iniciadaEm', concluida_em:'concluidaEm', custo_total:'custoTotal', custo_unitario:'custoUnitario', pedido_origem_id:'pedidoOrigemId' }
   },
   contasReceber: {
     table:  'contas_receber',
+    allowed: ['id','pedido_id','descricao','valor','vencimento','status','pago_em'],
     toDb:   { pedidoId:'pedido_id', pagoEm:'pago_em' },
     fromDb: { pedido_id:'pedidoId', pago_em:'pagoEm' }
   },
   contasPagar: {
     table:  'contas_pagar',
+    allowed: ['id','descricao','valor','vencimento','status','categoria','pago_em'],
     toDb:   { pagoEm:'pago_em' },
     fromDb: { pago_em:'pagoEm' }
   },
-  insumos: { toDb: {}, fromDb: {} },
-  logs:    { toDb: { alvoId:'alvo_id' }, fromDb: { alvo_id:'alvoId' } },
+  insumos: {
+    allowed: ['id','nome','tipo','unidade','cmp','saldo','minimo','ncm'],
+    toDb: {},
+    fromDb: {}
+  },
+  logs: {
+    allowed: ['id','modulo','acao','alvo_id','detalhe','data'],
+    toDb:   { alvoId:'alvo_id', entidadeId:'alvo_id', detalhes:'detalhe', criadoEm:'data' },
+    fromDb: { alvo_id:'alvoId', detalhe:'detalhes', data:'criadoEm' }
+  },
 };
 
 // Lista de chaves em state que sincronizam (em ordem para respeitar foreign keys)
@@ -174,10 +196,14 @@ function tableName(stateKey) {
 }
 
 function toDbRow(stateKey, obj) {
-  const map = FIELD_MAPS[stateKey]?.toDb || {};
+  const cfg = FIELD_MAPS[stateKey] || {};
+  const map = cfg.toDb || {};
+  const allowed = cfg.allowed || null;
   const out = {};
   for (const k in obj) {
     const dbKey = map[k] || k;
+    // Se temos lista de permitidos, filtra
+    if (allowed && !allowed.includes(dbKey)) continue;
     out[dbKey] = obj[k];
   }
   return out;
@@ -341,7 +367,7 @@ async function sha256(str) {
 }
 
 // ============================================================================
-// SEED — Initial data matching Sequilhos da Vovó Cida demo
+// SEED — Initial data matching Pitchu Doces demo
 // ============================================================================
 function seedData() {
   return {
@@ -359,9 +385,9 @@ function seedData() {
       nfeSerie: 1,
       nfeProximoNumero: 1,
     },
-    usuarioAtual: { id: 'u1', nome: 'Aparecida Souza', email: 'aparecida@sequilhosvovocida.com.br', perfil: 'proprietario' },
+    usuarioAtual: { id: 'u1', nome: 'Amanda Cecílio', email: 'amanda.cecilio@hotmail.com', perfil: 'proprietario' },
     usuarios: [
-      { id: 'u1', nome: 'Aparecida Souza', email: 'aparecida@sequilhosvovocida.com.br', perfil: 'proprietario', ativo: true },
+      { id: 'u1', nome: 'Amanda Cecílio', email: 'amanda.cecilio@hotmail.com', perfil: 'proprietario', ativo: true },
     ],
     permissoes: {
       proprietario: { '01':2,'02':2,'03':2,'05':2,'06':2,'07':2,'08':2,'09':2,'10':2,'11':2,'13':2,'15':2 },
@@ -425,8 +451,8 @@ function migrarState() {
     contato:{ responsavel:'', telefone:'', whatsapp:'', email:'' },
     nfeSerie:1, nfeProximoNumero:1
   };
-  if (!state.usuarioAtual) state.usuarioAtual = { id:'u1', nome:'Aparecida Souza', email:'aparecida@sequilhosvovocida.com.br', perfil:'proprietario' };
-  if (state.usuarios.length === 0) state.usuarios.push({ id:'u1', nome:'Aparecida Souza', email:'aparecida@sequilhosvovocida.com.br', perfil:'proprietario', ativo:true });
+  if (!state.usuarioAtual) state.usuarioAtual = { id:'u1', nome:'Amanda Cecílio', email:'amanda.cecilio@hotmail.com', perfil:'proprietario' };
+  if (state.usuarios.length === 0) state.usuarios.push({ id:'u1', nome:'Amanda Cecílio', email:'amanda.cecilio@hotmail.com', perfil:'proprietario', ativo:true });
   // 1) Markup — adicionar composição em R$/mês se ainda não existir
   if (!state.markup) state.markup = {};
   if (typeof state.markup.df !== 'number') state.markup.df = 17;
@@ -2018,8 +2044,12 @@ function renderPedidos() {
                 <td class="text-xs">${fmtDate(p.dataEntrega)}</td>
                 <td class="text-right num font-medium">${fmtBRL(p.total)}</td>
                 <td class="text-right">
-                  ${p.statusComercial === 'RASCUNHO' ? `<button class="btn text-xs btn-primary" onclick="handleConfirmarPedido('${p.id}')">Confirmar</button>` : ''}
-                  <button class="btn text-xs" onclick="abrirDetalhePedido('${p.id}')"><i data-lucide="eye" class="w-3 h-3"></i></button>
+                  <div class="flex gap-1 justify-end">
+                    ${p.statusComercial === 'RASCUNHO' ? `<button class="btn text-xs btn-primary" onclick="handleConfirmarPedido('${p.id}')" title="Confirmar pedido">Confirmar</button>` : ''}
+                    <button class="btn text-xs" onclick="abrirDetalhePedido('${p.id}')" title="Ver detalhes"><i data-lucide="eye" class="w-3 h-3"></i></button>
+                    ${['RASCUNHO','CONFIRMADO'].includes(p.statusComercial) ? `<button class="btn text-xs" onclick="editarPedido('${p.id}')" title="Editar"><i data-lucide="edit-2" class="w-3 h-3"></i></button>` : ''}
+                    ${p.statusComercial !== 'CANCELADO' ? `<button class="btn btn-danger text-xs" onclick="cancelarPedido('${p.id}')" title="Cancelar e estornar"><i data-lucide="x" class="w-3 h-3"></i></button>` : ''}
+                  </div>
                 </td>
               </tr>
             `;
@@ -2110,12 +2140,22 @@ function abrirDetalhePedido(pedidoId) {
     <div class="mt-3 p-3 bg-stone-50 rounded text-xs space-y-1">
       <p><span class="text-stone-500">Tipo:</span> ${tipo === 'ENCOMENDA' ? 'Encomenda (produção sob demanda)' : 'Pronta entrega (do estoque)'}</p>
       <p><span class="text-stone-500">Canal:</span> ${p.canal}</p>
+      <p><span class="text-stone-500">Forma de pagamento:</span> ${p.formaPagto || '<span class="text-stone-400">— não definida —</span>'}</p>
+      <p><span class="text-stone-500">Prazo:</span> ${p.prazoDias ? `${p.prazoDias} dias` : 'à vista'}</p>
       <p><span class="text-stone-500">Criado em:</span> ${fmtDateTime(p.criadoEm)}</p>
       <p><span class="text-stone-500">Entrega prometida:</span> ${fmtDate(p.dataEntrega)}</p>
       <p><span class="text-stone-500">Custo snapshot:</span> ${fmtBRL(p.custoSnapshot)} (congelado no momento da confirmação)</p>
+      ${p.statusComercial === 'CANCELADO' ? `<p class="mt-2 text-brand-coral-900"><strong>Cancelado em:</strong> ${p.canceladoEm ? fmtDateTime(p.canceladoEm) : '—'}<br><strong>Motivo:</strong> ${p.motivoCancelamento || '—'}</p>` : ''}
     </div>
-    <div class="text-right mt-4"><button class="btn" onclick="fecharModal()">Fechar</button></div>
+    <div class="flex justify-between gap-2 mt-4">
+      <div class="flex gap-2">
+        ${['RASCUNHO','CONFIRMADO'].includes(p.statusComercial) ? `<button class="btn" onclick="fecharModal(); editarPedido('${p.id}')"><i data-lucide="edit-2" class="w-3 h-3"></i> Editar</button>` : ''}
+        ${p.statusComercial !== 'CANCELADO' ? `<button class="btn btn-danger" onclick="cancelarPedido('${p.id}')"><i data-lucide="x" class="w-3 h-3"></i> Cancelar pedido</button>` : ''}
+      </div>
+      <button class="btn" onclick="fecharModal()">Fechar</button>
+    </div>
   `, 'lg');
+  if (typeof lucide!=='undefined') lucide.createIcons();
 }
 
 function abrirModalNovoPedido() {
@@ -2156,7 +2196,7 @@ function abrirModalNovoPedido() {
 
       <div class="grid grid-cols-2 gap-3">
         <div><label class="text-xs text-stone-600">Cliente</label>
-          <select name="clienteId" required class="input">
+          <select name="clienteId" required class="input" onchange="aplicarPagamentoDoCliente(this.value)">
             ${state.clientes.map(c => `<option value="${c.id}">${c.nome} (${c.tipo})</option>`).join('')}
           </select></div>
         <div><label class="text-xs text-stone-600">Canal</label>
@@ -2166,8 +2206,23 @@ function abrirModalNovoPedido() {
             <option value="ecommerce">E-commerce</option>
           </select></div>
       </div>
-      <div><label class="text-xs text-stone-600">Data de entrega prometida</label>
-        <input name="dataEntrega" type="date" required class="input" value="${todayISO()}"></div>
+      <div class="grid grid-cols-3 gap-3">
+        <div><label class="text-xs text-stone-600">Data de entrega</label>
+          <input name="dataEntrega" type="date" required class="input" value="${todayISO()}"></div>
+        <div><label class="text-xs text-stone-600">Forma de pagamento</label>
+          <select name="formaPagto" id="form-pgto-pedido" class="input">
+            <option value="">— usar do cliente —</option>
+            <option value="dinheiro">Dinheiro</option>
+            <option value="pix">PIX</option>
+            <option value="debito">Débito</option>
+            <option value="credito">Crédito</option>
+            <option value="boleto">Boleto</option>
+            <option value="prazo">Prazo (faturado)</option>
+          </select></div>
+        <div><label class="text-xs text-stone-600">Prazo (dias)</label>
+          <input name="prazoDias" type="number" min="0" step="1" id="prazo-pedido" class="input" placeholder="0 = à vista"></div>
+      </div>
+      <p class="text-[10px] text-stone-500 mt-1">💡 Se deixar em branco, usa a forma e prazo padrão do cliente selecionado.</p>
 
       <div>
         <div class="flex items-center justify-between mb-1">
@@ -2844,14 +2899,22 @@ function criarPedidoComOP(form, fd, itens, tipo, faltam, criarOPs, totalFinal, b
   }
 
   const proxNum = Math.max(...state.pedidos.map(p => p.numero), 0) + 1;
+  // Forma e prazo de pagamento — usa do form, ou fallback do cliente
+  const cli = state.clientes.find(c => c.id === fd.get('clienteId'));
+  const formaPagto = fd.get('formaPagto') || cli?.formaPagto || '';
+  const prazoDiasInput = fd.get('prazoDias');
+  const prazoDias = (prazoDiasInput !== '' && prazoDiasInput != null)
+    ? parseInt(prazoDiasInput)
+    : (cli?.prazoDias || 0);
   const novoPedido = {
     id: 'pe'+uid(), numero: proxNum, tipo,
     clienteId: fd.get('clienteId'), canal: fd.get('canal'),
+    formaPagto, prazoDias,
     statusComercial: 'RASCUNHO', statusProdutivo: 'AGUARDANDO',
     criadoEm: new Date().toISOString(), dataEntrega: fd.get('dataEntrega'),
-    subtotal,                                // soma dos itens sem arredondamento
-    total: totalFinal,                       // valor cobrado (com arredondamento)
-    bonificacao: bonificacao || 0,           // delta = total − subtotal (pode ser ±)
+    subtotal,
+    total: totalFinal,
+    bonificacao: bonificacao || 0,
     custoSnapshot,
     itens
   };
@@ -2893,6 +2956,174 @@ function criarPedidoComOP(form, fd, itens, tipo, faltam, criarOPs, totalFinal, b
   } else {
     toast(`Pedido #${proxNum} (${tipo === 'ENCOMENDA' ? 'encomenda' : 'pronta entrega'}) criado como rascunho`);
   }
+  render();
+}
+
+// ----- Pré-preenche forma/prazo de pagto do cliente ao trocar no select ----
+function aplicarPagamentoDoCliente(clienteId) {
+  const cli = state.clientes.find(c => c.id === clienteId);
+  if (!cli) return;
+  const selForma = document.getElementById('form-pgto-pedido');
+  const inputPrazo = document.getElementById('prazo-pedido');
+  if (selForma && !selForma.value) selForma.value = cli.formaPagto || '';
+  if (inputPrazo && !inputPrazo.value) inputPrazo.value = cli.prazoDias || '';
+}
+
+// ----- Cancelar pedido (com estorno de estoque, embalagem e contas) --------
+async function cancelarPedido(pedidoId) {
+  const p = state.pedidos.find(x => x.id === pedidoId);
+  if (!p) return;
+  if (p.statusComercial === 'CANCELADO') {
+    toast('Pedido já está cancelado', 'erro');
+    return;
+  }
+  const motivo = prompt(`Cancelar pedido #${p.numero}?\n\nIsso vai:\n- Marcar pedido como CANCELADO\n- Estornar saldo de produtos (se já foi baixado)\n- Estornar saldo de embalagens\n- Cancelar conta a receber vinculada\n- Cancelar OPs vinculadas (se não iniciadas)\n\nMotivo do cancelamento:`);
+  if (motivo === null) return; // cancelou o prompt
+  // Estorno de PA + embalagem (só se já foi confirmado)
+  if (p.statusComercial !== 'RASCUNHO') {
+    const necessario = {};
+    const necessarioEmb = {};
+    p.itens.forEach(it => {
+      const prod = state.produtos.find(x => x.id === it.produtoId);
+      if (prod) {
+        const gramatura = it.gramatura || prod.pesoLiq;
+        const unEq = (it.qtd * gramatura) / (prod.pesoLiq || 500);
+        necessario[it.produtoId] = (necessario[it.produtoId] || 0) + unEq;
+      }
+      if (it.modo === 'EMBALAGEM' && it.embalagemId) {
+        necessarioEmb[it.embalagemId] = (necessarioEmb[it.embalagemId] || 0) + it.qtd;
+      }
+    });
+    for (const [produtoId, qtd] of Object.entries(necessario)) {
+      const prod = state.produtos.find(x => x.id === produtoId);
+      if (prod) prod.saldoPa = (Number(prod.saldoPa) || 0) + qtd;
+    }
+    for (const [embId, qtd] of Object.entries(necessarioEmb)) {
+      const emb = state.insumos.find(i => i.id === embId);
+      if (emb) emb.saldo = (Number(emb.saldo) || 0) + qtd;
+    }
+  }
+  // Cancelar conta a receber
+  state.contasReceber.forEach(c => {
+    if (c.pedidoId === pedidoId && c.status === 'ABERTA') c.status = 'CANCELADA';
+  });
+  // Cancelar OPs programadas/em andamento ainda não concluídas
+  state.ordens.forEach(o => {
+    if (o.pedidoOrigemId === pedidoId && o.status !== 'CONCLUIDA') {
+      o.status = 'CANCELADA';
+    }
+  });
+  // Marcar pedido
+  p.statusComercial = 'CANCELADO';
+  p.statusProdutivo = 'CANCELADO';
+  p.canceladoEm = new Date().toISOString();
+  p.motivoCancelamento = motivo;
+  logAuditoria('06_pedido', 'CANCELADO', p.id, `Pedido #${p.numero} cancelado · motivo: ${motivo}`);
+  persistState();
+  toast(`Pedido #${p.numero} cancelado · estoque estornado`);
+  fecharModal();
+  render();
+}
+
+// ----- Editar pedido existente (RASCUNHO ou CONFIRMADO) -------------------
+function editarPedido(pedidoId) {
+  const p = state.pedidos.find(x => x.id === pedidoId);
+  if (!p) return;
+  if (p.statusComercial === 'CANCELADO') {
+    toast('Pedido cancelado não pode ser editado', 'erro');
+    return;
+  }
+  if (p.statusComercial === 'PAGO' || p.statusComercial === 'FATURADO') {
+    toast(`Pedido com status ${p.statusComercial} não pode ser editado · cancele e refaça`, 'erro');
+    return;
+  }
+  const cli = state.clientes.find(c => c.id === p.clienteId);
+  abrirModal(`
+    <h2 class="font-display text-xl mb-1">Editar pedido #${p.numero}</h2>
+    <p class="text-sm text-stone-500 mb-3">${cli?.nome || ''} · status: ${p.statusComercial}</p>
+
+    <form onsubmit="handleEditarPedido(event, '${pedidoId}')" class="space-y-3">
+
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="text-xs text-stone-600">Data de entrega</label>
+          <input name="dataEntrega" type="date" class="input" value="${p.dataEntrega || ''}"></div>
+        <div><label class="text-xs text-stone-600">Canal</label>
+          <select name="canal" class="input">
+            ${['whatsapp','telefone','representante','b2c','ecommerce'].map(c =>
+              `<option value="${c}" ${c===p.canal?'selected':''}>${c}</option>`).join('')}
+          </select></div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="text-xs text-stone-600">Forma de pagamento</label>
+          <select name="formaPagto" class="input">
+            <option value="">— sem definir —</option>
+            ${['dinheiro','pix','debito','credito','boleto','prazo'].map(f =>
+              `<option value="${f}" ${f===p.formaPagto?'selected':''}>${f}</option>`).join('')}
+          </select></div>
+        <div><label class="text-xs text-stone-600">Prazo (dias)</label>
+          <input name="prazoDias" type="number" min="0" class="input" value="${p.prazoDias || 0}"></div>
+      </div>
+
+      <div class="border-t border-stone-200 pt-3 mt-3">
+        <p class="module-tag mb-2">ITENS DO PEDIDO (somente leitura)</p>
+        <p class="text-[11px] text-stone-500 mb-2">Para alterar itens, cancele este pedido e crie um novo.</p>
+        <table class="text-xs">
+          <thead><tr><th>Produto</th><th>Embalagem</th><th class="text-right">Gramatura</th><th class="text-right">Qtd</th><th class="text-right">Preço</th><th class="text-right">Total</th></tr></thead>
+          <tbody>
+            ${p.itens.map(i => {
+              const prod = state.produtos.find(x => x.id === i.produtoId);
+              const emb = i.embalagemId ? state.insumos.find(x => x.id === i.embalagemId) : null;
+              return `<tr>
+                <td>${prod?.nome || '—'}</td>
+                <td>${emb?.nome || '<span class="text-stone-400">fracionado</span>'}</td>
+                <td class="text-right num">${i.gramatura}g</td>
+                <td class="text-right num">${i.qtd}</td>
+                <td class="text-right num">${fmtBRL(i.preco)}</td>
+                <td class="text-right num font-medium">${fmtBRL(i.qtd * i.preco)}</td>
+              </tr>`;
+            }).join('')}
+            <tr class="bg-stone-50"><td colspan="5" class="text-right">Total cobrado</td>
+              <td class="text-right num font-medium">${fmtBRL(p.total)}</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="flex justify-between items-center gap-2 pt-3">
+        <button type="button" class="btn btn-danger text-xs" onclick="cancelarPedido('${pedidoId}')">
+          <i data-lucide="x" class="w-3 h-3"></i> Cancelar pedido (estorna estoque)
+        </button>
+        <div class="flex gap-2">
+          <button type="button" class="btn" onclick="fecharModal()">Voltar</button>
+          <button type="submit" class="btn btn-primary">Salvar alterações</button>
+        </div>
+      </div>
+    </form>
+  `, 'lg');
+  if (typeof lucide!=='undefined') lucide.createIcons();
+}
+
+function handleEditarPedido(ev, pedidoId) {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const p = state.pedidos.find(x => x.id === pedidoId);
+  if (!p) return;
+  p.dataEntrega = fd.get('dataEntrega') || p.dataEntrega;
+  p.canal = fd.get('canal') || p.canal;
+  p.formaPagto = fd.get('formaPagto') || '';
+  p.prazoDias = parseInt(fd.get('prazoDias')) || 0;
+  // Atualizar conta a receber se prazo mudou
+  state.contasReceber.forEach(c => {
+    if (c.pedidoId === pedidoId && c.status === 'ABERTA') {
+      const novaVenc = new Date(p.criadoEm);
+      novaVenc.setDate(novaVenc.getDate() + p.prazoDias);
+      c.vencimento = novaVenc.toISOString().slice(0,10);
+    }
+  });
+  logAuditoria('06_pedido', 'EDITADO', p.id, `Pedido #${p.numero} editado · forma ${p.formaPagto || '—'} · prazo ${p.prazoDias}d`);
+  persistState();
+  fecharModal();
+  toast('Pedido atualizado');
   render();
 }
 
@@ -4126,7 +4357,7 @@ function mostrarTelaLogin() {
     </style>
     <div class="login-card">
       <h1>SequilhoPRO</h1>
-      <p class="sub">Sequilhos da Vovó Cida · acesso ao sistema</p>
+      <p class="sub">Pitchu Doces · acesso ao sistema</p>
       <form id="login-form">
         <label>Email</label>
         <input type="email" name="email" required autocomplete="email" placeholder="seu@email.com">
