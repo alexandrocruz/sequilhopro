@@ -348,16 +348,43 @@ function mostrarStatusSync(estado) {
 
 const fmtBRL = v => 'R$ ' + (Number(v)||0).toLocaleString('pt-BR', {minimumFractionDigits:2, maximumFractionDigits:2});
 const fmtNum = (v, d=3) => (Number(v)||0).toLocaleString('pt-BR', {minimumFractionDigits:0, maximumFractionDigits:d});
+
+// Parse de data tipo "YYYY-MM-DD" como fuso LOCAL (evita o bug do UTC).
+// Quando JS recebe "2026-05-19" e faz new Date(), interpreta como meia-noite UTC.
+// Em BR (UTC−3) isso vira 18/05 21h — exibe 1 dia antes. Esta função corrige.
+function parseDataBR(s) {
+  if (!s) return null;
+  if (s instanceof Date) return s;
+  if (typeof s !== 'string') return new Date(s);
+  // String "YYYY-MM-DD" pura (sem horário) → criar como data local
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+  // String com horário (ISO completo) — JS já interpreta certo
+  return new Date(s);
+}
+
 const fmtDate = d => {
-  const dt = (typeof d === 'string') ? new Date(d) : d;
+  const dt = parseDataBR(d);
+  if (!dt) return '';
   return dt.toLocaleDateString('pt-BR');
 };
 const fmtDateTime = d => {
-  const dt = (typeof d === 'string') ? new Date(d) : d;
+  const dt = parseDataBR(d);
+  if (!dt) return '';
   return dt.toLocaleString('pt-BR', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' });
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
-const todayISO = () => new Date().toISOString().slice(0,10);
+const todayISO = () => {
+  // Data de hoje em fuso LOCAL como "YYYY-MM-DD"
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+};
+// Adiciona N dias a uma data string "YYYY-MM-DD" (sem bug de fuso)
+function addDaysISO(dataISO, dias) {
+  const dt = parseDataBR(dataISO) || new Date();
+  dt.setDate(dt.getDate() + (Number(dias) || 0));
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+}
 
 // Simple SHA-256 for audit hashing (Web Crypto API)
 async function sha256(str) {
@@ -704,12 +731,14 @@ function confirmarPedido(pedidoId) {
   }
   // Gerar conta a receber
   const cli = state.clientes.find(c => c.id === p.clienteId);
-  const venc = new Date();
-  venc.setDate(venc.getDate() + (cli.prazoDias || 0));
+  // Prazo: usa do pedido se definido, senão usa do cliente
+  const prazoDias = (typeof p.prazoDias === 'number') ? p.prazoDias : (cli?.prazoDias || 0);
+  const baseData = todayISO(); // data atual em fuso local
+  const vencimento = addDaysISO(baseData, prazoDias);
   state.contasReceber.unshift({
     id: 'cr'+uid(), pedidoId: p.id,
     descricao: `Pedido #${p.numero} · ${cli.nome}`,
-    valor: p.total, vencimento: venc.toISOString().slice(0,10), status: 'ABERTA'
+    valor: p.total, vencimento, status: 'ABERTA'
   });
   logAuditoria('06_pedido', 'CONFIRMADO', p.id, `Pedido #${p.numero} (${tipo === 'ENCOMENDA' ? 'encomenda' : 'pronta entrega'}) confirmado · ${fmtBRL(p.total)}`);
   persistState();
@@ -3038,6 +3067,13 @@ function editarPedido(pedidoId) {
     return;
   }
   const cli = state.clientes.find(c => c.id === p.clienteId);
+  // Snapshot dos itens originais para calcular diferenças no salvar
+  window._editPedSnapshot = {
+    id: pedidoId,
+    itensOriginais: JSON.parse(JSON.stringify(p.itens || [])),
+    statusOriginal: p.statusComercial,
+    totalOriginal: p.total
+  };
   abrirModal(`
     <h2 class="font-display text-xl mb-1">Editar pedido #${p.numero}</h2>
     <p class="text-sm text-stone-500 mb-3">${cli?.nome || ''} · status: ${p.statusComercial}</p>
@@ -3066,27 +3102,26 @@ function editarPedido(pedidoId) {
       </div>
 
       <div class="border-t border-stone-200 pt-3 mt-3">
-        <p class="module-tag mb-2">ITENS DO PEDIDO (somente leitura)</p>
-        <p class="text-[11px] text-stone-500 mb-2">Para alterar itens, cancele este pedido e crie um novo.</p>
-        <table class="text-xs">
-          <thead><tr><th>Produto</th><th>Embalagem</th><th class="text-right">Gramatura</th><th class="text-right">Qtd</th><th class="text-right">Preço</th><th class="text-right">Total</th></tr></thead>
+        <p class="module-tag mb-2">ITENS DO PEDIDO (edição livre)</p>
+        <p class="text-[11px] text-stone-500 mb-2">💡 Ajuste gramatura, qtd e preço. O preço unitário é recalculado automaticamente ao mudar gramatura — você pode sobrescrever digitando direto no campo.</p>
+        <table class="text-xs" id="tabela-itens-edicao">
+          <thead><tr>
+            <th>Produto</th>
+            <th>Embalagem</th>
+            <th class="text-right">Gramatura (g)</th>
+            <th class="text-right">Qtd</th>
+            <th class="text-right">Preço un.</th>
+            <th class="text-right">Subtotal</th>
+          </tr></thead>
           <tbody>
-            ${p.itens.map(i => {
-              const prod = state.produtos.find(x => x.id === i.produtoId);
-              const emb = i.embalagemId ? state.insumos.find(x => x.id === i.embalagemId) : null;
-              return `<tr>
-                <td>${prod?.nome || '—'}</td>
-                <td>${emb?.nome || '<span class="text-stone-400">fracionado</span>'}</td>
-                <td class="text-right num">${i.gramatura}g</td>
-                <td class="text-right num">${i.qtd}</td>
-                <td class="text-right num">${fmtBRL(i.preco)}</td>
-                <td class="text-right num font-medium">${fmtBRL(i.qtd * i.preco)}</td>
-              </tr>`;
-            }).join('')}
-            <tr class="bg-stone-50"><td colspan="5" class="text-right">Total cobrado</td>
-              <td class="text-right num font-medium">${fmtBRL(p.total)}</td></tr>
+            ${p.itens.map((i, idx) => renderItemEdicaoRow(i, idx)).join('')}
+            <tr class="bg-stone-50" id="linha-total-pedido">
+              <td colspan="5" class="text-right font-medium">Total cobrado</td>
+              <td class="text-right num font-medium" id="total-pedido-edicao">${fmtBRL(p.total)}</td>
+            </tr>
           </tbody>
         </table>
+        <div id="avisos-edicao" class="mt-2 space-y-1"></div>
       </div>
 
       <div class="flex justify-between items-center gap-2 pt-3">
@@ -3101,6 +3136,139 @@ function editarPedido(pedidoId) {
     </form>
   `, 'lg');
   if (typeof lucide!=='undefined') lucide.createIcons();
+  recalcularTotalEdicao();
+}
+
+// Renderiza linha de item editável (preserva ordem original via data-idx)
+function renderItemEdicaoRow(i, idx) {
+  const prod = state.produtos.find(x => x.id === i.produtoId);
+  const emb = i.embalagemId ? state.insumos.find(x => x.id === i.embalagemId) : null;
+  return `
+    <tr data-idx="${idx}" class="item-edicao">
+      <td>${prod?.nome || '—'}<br><span class="text-[10px] text-stone-500">${prod?.sku || ''}</span></td>
+      <td class="text-xs">${emb?.nome || '<span class="text-stone-400">fracionado</span>'}</td>
+      <td class="text-right">
+        <input type="number" min="1" step="1" value="${i.gramatura}"
+          data-original-gramatura="${i.gramatura}"
+          data-produto-id="${i.produtoId}"
+          class="input text-xs num text-right" style="width:80px;"
+          oninput="recalcularPrecoItemEdicao(${idx})">
+      </td>
+      <td class="text-right">
+        <input type="number" min="0" step="1" value="${i.qtd}"
+          class="input text-xs num text-right" style="width:60px;"
+          oninput="recalcularSubtotalItemEdicao(${idx})">
+      </td>
+      <td class="text-right">
+        <input type="number" min="0" step="0.01" value="${(i.preco||0).toFixed(2)}"
+          data-foi-editado="0"
+          class="input text-xs num text-right" style="width:90px;"
+          oninput="this.dataset.foiEditado='1'; recalcularSubtotalItemEdicao(${idx})">
+      </td>
+      <td class="text-right num font-medium" id="subtotal-edicao-${idx}">${fmtBRL((Number(i.qtd)||0) * (Number(i.preco)||0))}</td>
+    </tr>
+  `;
+}
+
+// Recalcula preço sugerido baseado em R$/g da ficha técnica × nova gramatura
+// (só se usuário não tiver editado manualmente o preço)
+function recalcularPrecoItemEdicao(idx) {
+  const row = document.querySelector(`tr.item-edicao[data-idx="${idx}"]`);
+  if (!row) return;
+  const inputGramatura = row.querySelector('input[data-original-gramatura]');
+  const inputPreco = row.querySelector('input[data-foi-editado]');
+  const produtoId = inputGramatura.dataset.produtoId;
+  const novaGramatura = parseFloat(inputGramatura.value) || 0;
+
+  if (inputPreco.dataset.foiEditado !== '1' && novaGramatura > 0) {
+    // Calcular preço sugerido = preçoEmbalagemCompleta / pesoLiq * gramatura, arredondado a R$ 0,10
+    const prod = state.produtos.find(x => x.id === produtoId);
+    const rec = state.receitas.find(rc => rc.produtoId === produtoId && rc.ativa);
+    if (prod && rec) {
+      const custo = calcularCustoReceita(rec.id);
+      const precoCompleto = custo ? calcularPrecoSugerido(custo.custoTotal) : 0;
+      const precoG = (precoCompleto / (prod.pesoLiq || 500)) * novaGramatura;
+      inputPreco.value = (Math.round(precoG * 10) / 10).toFixed(2);
+    }
+  }
+  recalcularSubtotalItemEdicao(idx);
+}
+
+// Recalcula só o subtotal de uma linha
+function recalcularSubtotalItemEdicao(idx) {
+  const row = document.querySelector(`tr.item-edicao[data-idx="${idx}"]`);
+  if (!row) return;
+  const inputs = row.querySelectorAll('input');
+  const gramatura = parseFloat(inputs[0].value) || 0;
+  const qtd = parseFloat(inputs[1].value) || 0;
+  const preco = parseFloat(inputs[2].value) || 0;
+  const sub = qtd * preco;
+  const cell = document.getElementById(`subtotal-edicao-${idx}`);
+  if (cell) cell.textContent = fmtBRL(sub);
+  recalcularTotalEdicao();
+}
+
+// Recalcula total geral + valida saldos disponíveis
+function recalcularTotalEdicao() {
+  let total = 0;
+  const snapshot = window._editPedSnapshot;
+  if (!snapshot) return;
+  // Diferenças por produto (em unidades equivalentes) e por embalagem
+  const difPA = {}; // produtoId → diferença (positiva = baixar mais, negativa = estornar)
+  const difEmb = {};
+  document.querySelectorAll('tr.item-edicao').forEach(row => {
+    const idx = parseInt(row.dataset.idx);
+    const inputs = row.querySelectorAll('input');
+    const gramatura = parseFloat(inputs[0].value) || 0;
+    const qtd = parseFloat(inputs[1].value) || 0;
+    const preco = parseFloat(inputs[2].value) || 0;
+    total += qtd * preco;
+    const original = snapshot.itensOriginais[idx];
+    if (!original) return;
+    const prod = state.produtos.find(x => x.id === original.produtoId);
+    if (!prod) return;
+    // Diferença de unidades equivalentes (gramatura × qtd) / pesoLiq
+    const unEqOriginal = (original.gramatura * original.qtd) / (prod.pesoLiq || 500);
+    const unEqNovo = (gramatura * qtd) / (prod.pesoLiq || 500);
+    const diff = unEqNovo - unEqOriginal;
+    if (diff !== 0) difPA[prod.id] = (difPA[prod.id] || 0) + diff;
+    // Diferença de embalagem (modo EMBALAGEM)
+    if (original.modo === 'EMBALAGEM' && original.embalagemId) {
+      const diffEmb = qtd - original.qtd;
+      if (diffEmb !== 0) difEmb[original.embalagemId] = (difEmb[original.embalagemId] || 0) + diffEmb;
+    }
+  });
+
+  // Atualizar total na tabela
+  const totalCell = document.getElementById('total-pedido-edicao');
+  if (totalCell) totalCell.textContent = fmtBRL(total);
+
+  // Validar saldos (avisar se estoque insuficiente para aumento)
+  const avisosBox = document.getElementById('avisos-edicao');
+  if (!avisosBox) return;
+  const alertas = [];
+  // Só validamos se status original já consumiu estoque (CONFIRMADO em diante)
+  if (snapshot.statusOriginal !== 'RASCUNHO') {
+    for (const [produtoId, diff] of Object.entries(difPA)) {
+      if (diff > 0) { // está pedindo MAIS do que antes
+        const prod = state.produtos.find(x => x.id === produtoId);
+        if (prod && prod.saldoPa < diff) {
+          alertas.push(`⚠ ${prod.nome}: precisa baixar mais ${fmtNum(diff,2)} un, mas tem só ${fmtNum(prod.saldoPa,2)} em estoque`);
+        }
+      }
+    }
+    for (const [embId, diffE] of Object.entries(difEmb)) {
+      if (diffE > 0) {
+        const emb = state.insumos.find(i => i.id === embId);
+        if (emb && emb.saldo < diffE) {
+          alertas.push(`⚠ ${emb.nome}: precisa baixar mais ${diffE} ${emb.unidade}, mas tem só ${emb.saldo}`);
+        }
+      }
+    }
+  }
+  avisosBox.innerHTML = alertas.length === 0
+    ? `<p class="text-[11px] text-brand-teal-900">✓ Saldos disponíveis suficientes para as alterações.</p>`
+    : alertas.map(a => `<p class="text-[11px]" style="color:#501313; background:#FCEBEB; padding:4px 8px; border-radius:4px;">${a}</p>`).join('');
 }
 
 function handleEditarPedido(ev, pedidoId) {
@@ -3108,22 +3276,127 @@ function handleEditarPedido(ev, pedidoId) {
   const fd = new FormData(ev.target);
   const p = state.pedidos.find(x => x.id === pedidoId);
   if (!p) return;
+  const snapshot = window._editPedSnapshot;
+  if (!snapshot || snapshot.id !== pedidoId) {
+    toast('Estado de edição perdido — feche e tente novamente', 'erro');
+    return;
+  }
+
+  // Coletar novos valores dos itens
+  const novosItens = [];
+  const linhas = document.querySelectorAll('tr.item-edicao');
+  linhas.forEach(row => {
+    const idx = parseInt(row.dataset.idx);
+    const original = snapshot.itensOriginais[idx];
+    if (!original) return;
+    const inputs = row.querySelectorAll('input');
+    const gramatura = parseFloat(inputs[0].value) || 0;
+    const qtd = parseFloat(inputs[1].value) || 0;
+    const preco = parseFloat(inputs[2].value) || 0;
+    if (gramatura <= 0 || qtd <= 0 || preco < 0) return;
+    novosItens.push({
+      ...original, // preserva modo, embalagemId, produtoId
+      gramatura, qtd, preco
+    });
+  });
+  if (novosItens.length === 0) {
+    toast('O pedido precisa ter pelo menos um item', 'erro');
+    return;
+  }
+
+  // Calcular diferenças de estoque para aplicar (PA + embalagem)
+  const difPA = {};
+  const difEmb = {};
+  snapshot.itensOriginais.forEach((orig, idx) => {
+    const novo = novosItens[idx];
+    if (!novo) return;
+    const prod = state.produtos.find(x => x.id === orig.produtoId);
+    if (!prod) return;
+    const unEqOrig = (orig.gramatura * orig.qtd) / (prod.pesoLiq || 500);
+    const unEqNovo = (novo.gramatura * novo.qtd) / (prod.pesoLiq || 500);
+    const diff = unEqNovo - unEqOrig;
+    if (diff !== 0) difPA[prod.id] = (difPA[prod.id] || 0) + diff;
+    if (orig.modo === 'EMBALAGEM' && orig.embalagemId) {
+      const diffE = novo.qtd - orig.qtd;
+      if (diffE !== 0) difEmb[orig.embalagemId] = (difEmb[orig.embalagemId] || 0) + diffE;
+    }
+  });
+
+  // Aplicar diferenças NO ESTOQUE — só se pedido já estava CONFIRMADO (estoque foi consumido)
+  if (snapshot.statusOriginal !== 'RASCUNHO') {
+    // Validar saldos primeiro
+    for (const [produtoId, diff] of Object.entries(difPA)) {
+      if (diff > 0) {
+        const prod = state.produtos.find(x => x.id === produtoId);
+        if (prod && prod.saldoPa < diff) {
+          toast(`Saldo insuficiente para ${prod.nome} (precisa de mais ${fmtNum(diff,2)} un, tem ${fmtNum(prod.saldoPa,2)})`, 'erro');
+          return;
+        }
+      }
+    }
+    for (const [embId, diffE] of Object.entries(difEmb)) {
+      if (diffE > 0) {
+        const emb = state.insumos.find(i => i.id === embId);
+        if (emb && emb.saldo < diffE) {
+          toast(`Saldo de embalagem insuficiente: ${emb.nome}`, 'erro');
+          return;
+        }
+      }
+    }
+    // Aplicar
+    for (const [produtoId, diff] of Object.entries(difPA)) {
+      const prod = state.produtos.find(x => x.id === produtoId);
+      if (prod) prod.saldoPa = Math.max(0, (Number(prod.saldoPa) || 0) - diff);
+    }
+    for (const [embId, diffE] of Object.entries(difEmb)) {
+      const emb = state.insumos.find(i => i.id === embId);
+      if (emb) emb.saldo = Math.max(0, (Number(emb.saldo) || 0) - diffE);
+    }
+  }
+
+  // Atualizar pedido
+  p.itens = novosItens;
+  p.subtotal = novosItens.reduce((s, i) => s + (i.qtd * i.preco), 0);
+  // Preserva bonificação proporcional se total era arredondado? Por simplicidade, zera.
+  // Custo snapshot recalculado
+  let custoSnapshot = 0;
+  for (const it of novosItens) {
+    const prod = state.produtos.find(x => x.id === it.produtoId);
+    const r = state.receitas.find(rec => rec.produtoId === it.produtoId && rec.ativa);
+    if (r && prod) {
+      const c = calcularCustoReceita(r.id);
+      const fator = it.gramatura / (prod.pesoLiq || 500);
+      custoSnapshot += c.custoTotal * fator * it.qtd;
+    }
+    if (it.modo === 'EMBALAGEM' && it.embalagemId) {
+      const emb = state.insumos.find(ins => ins.id === it.embalagemId);
+      if (emb) custoSnapshot += (Number(emb.cmp) || 0) * it.qtd;
+    }
+  }
+  p.custoSnapshot = custoSnapshot;
+  // Total = subtotal (sem novo arredondamento) + bonificação anterior se houver
+  p.total = p.subtotal + (Number(p.bonificacao) || 0);
+
+  // Atualizar campos extra do form
   p.dataEntrega = fd.get('dataEntrega') || p.dataEntrega;
   p.canal = fd.get('canal') || p.canal;
   p.formaPagto = fd.get('formaPagto') || '';
   p.prazoDias = parseInt(fd.get('prazoDias')) || 0;
-  // Atualizar conta a receber se prazo mudou
+
+  // Atualizar conta a receber
   state.contasReceber.forEach(c => {
     if (c.pedidoId === pedidoId && c.status === 'ABERTA') {
-      const novaVenc = new Date(p.criadoEm);
-      novaVenc.setDate(novaVenc.getDate() + p.prazoDias);
-      c.vencimento = novaVenc.toISOString().slice(0,10);
+      const dataCriacao = (p.criadoEm || '').slice(0, 10) || todayISO();
+      c.vencimento = addDaysISO(dataCriacao, p.prazoDias);
+      c.valor = p.total;
     }
   });
-  logAuditoria('06_pedido', 'EDITADO', p.id, `Pedido #${p.numero} editado · forma ${p.formaPagto || '—'} · prazo ${p.prazoDias}d`);
+
+  logAuditoria('06_pedido', 'EDITADO', p.id, `Pedido #${p.numero} editado · novo total ${fmtBRL(p.total)} · ${novosItens.length} item(ns)`);
+  delete window._editPedSnapshot;
   persistState();
   fecharModal();
-  toast('Pedido atualizado');
+  toast(`Pedido #${p.numero} atualizado · total ${fmtBRL(p.total)}`);
   render();
 }
 
@@ -3610,7 +3883,31 @@ function iniciarOP(opId) {
 function toggleFaseOP(opId, faseIdx) {
   const o = state.ordens.find(x => x.id === opId);
   if (!o || o.status !== 'EM_ANDAMENTO') return;
-  o.fases[faseIdx].concluida = !o.fases[faseIdx].concluida;
+  const fase = o.fases[faseIdx];
+  const agora = new Date().toISOString();
+  const operador = state.usuarioAtual?.nome || state.usuarioAtual?.email || 'operador';
+
+  if (!fase.concluida) {
+    // Marcando como concluída agora
+    // Define `fim` desta fase como agora
+    fase.fim = agora;
+    fase.operador = operador;
+    // Início desta fase = max(início da OP, fim da fase anterior, ou agora se nenhum)
+    if (!fase.inicio) {
+      const faseAnt = o.fases[faseIdx - 1];
+      fase.inicio = (faseAnt && faseAnt.fim) ? faseAnt.fim : (o.iniciadaEm || agora);
+    }
+    // Calcula duração em minutos
+    const inicioMs = new Date(fase.inicio).getTime();
+    const fimMs = new Date(fase.fim).getTime();
+    fase.duracaoMin = Math.max(0, Math.round((fimMs - inicioMs) / 60000));
+    fase.concluida = true;
+  } else {
+    // Desmarcando: limpa fim e duração, mas preserva inicio (pode reconcluir depois)
+    fase.fim = null;
+    fase.duracaoMin = null;
+    fase.concluida = false;
+  }
   persistState();
   render();
 }
@@ -3696,6 +3993,21 @@ function abrirDetalheOPConcluida(opId) {
   const o = state.ordens.find(x => x.id === opId);
   if (!o) return;
   const p = state.produtos.find(x => x.id === o.produtoId);
+  const r = state.receitas.find(rec => rec.produtoId === o.produtoId && rec.ativa);
+  // Tempo real = soma das durações das fases (em min)
+  const tempoRealMin = (o.fases || []).reduce((s, f) => s + (Number(f.duracaoMin) || 0), 0);
+  // Tempo teórico da ficha (em min) × proporção do lote vs rendimento da ficha
+  let tempoTeoricoMin = 0;
+  if (r && r.tempoH) {
+    const lotes = o.tamanhoLote / Math.max(r.rendimentoUn || 1, 1);
+    tempoTeoricoMin = Math.round(r.tempoH * 60 * lotes);
+  }
+  const pct = tempoTeoricoMin > 0 ? Math.round((tempoRealMin / tempoTeoricoMin) * 100) : null;
+  const fmtMin = m => {
+    const v = Math.round(Number(m) || 0);
+    if (v < 60) return v + ' min';
+    return Math.floor(v / 60) + 'h' + String(v % 60).padStart(2, '0');
+  };
   abrirModal(`
     <h2 class="font-display text-xl">OP-${o.numero}</h2>
     <p class="text-sm text-stone-500 mb-4">${p?.nome || '—'} · ${o.tamanhoLote} unidades</p>
@@ -3717,10 +4029,39 @@ function abrirDetalheOPConcluida(opId) {
         <p class="num font-medium text-brand-teal-900">${fmtBRL(o.custoUnitario || 0)}</p>
       </div>
     </div>
-    <p class="text-xs font-medium mb-1">Fases</p>
-    <ul class="text-xs space-y-1">
-      ${o.fases.map(f => `<li>${f.concluida ? '✓' : '○'} ${f.nome}</li>`).join('')}
-    </ul>
+
+    ${tempoTeoricoMin > 0 ? `
+      <div class="p-3 rounded text-xs mb-3" style="background:${pct > 110 ? '#FAEEDA' : pct < 90 ? '#E1F5EE' : '#EEEDFE'};">
+        <div class="flex justify-between items-center">
+          <span class="${pct > 110 ? 'text-brand-amber-900' : pct < 90 ? 'text-brand-teal-900' : 'text-brand-purple-900'}">
+            <strong>Tempo real:</strong> ${fmtMin(tempoRealMin)} · <strong>Teórico:</strong> ${fmtMin(tempoTeoricoMin)}
+          </span>
+          <span class="num font-medium ${pct > 110 ? 'text-brand-amber-900' : pct < 90 ? 'text-brand-teal-900' : 'text-brand-purple-900'}">
+            ${pct}% do esperado
+          </span>
+        </div>
+      </div>
+    ` : `
+      ${tempoRealMin > 0 ? `<p class="text-xs mb-2 text-stone-600"><strong>Tempo total real:</strong> ${fmtMin(tempoRealMin)}</p>` : ''}
+    `}
+
+    <p class="text-xs font-medium mb-2">Fases · cronometragem</p>
+    <table class="text-xs">
+      <thead><tr><th></th><th>Fase</th><th>Início</th><th>Fim</th><th class="text-right">Duração</th><th>Operador</th></tr></thead>
+      <tbody>
+        ${o.fases.map(f => `
+          <tr>
+            <td>${f.concluida ? '<span style="color:#1D9E75">✓</span>' : '<span style="color:#A8A39B">○</span>'}</td>
+            <td>${f.nome}</td>
+            <td class="text-xs text-stone-500">${f.inicio ? fmtDateTime(f.inicio) : '—'}</td>
+            <td class="text-xs text-stone-500">${f.fim ? fmtDateTime(f.fim) : '—'}</td>
+            <td class="text-right num">${f.duracaoMin != null ? fmtMin(f.duracaoMin) : '—'}</td>
+            <td class="text-xs text-stone-500">${f.operador || '—'}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+    <p class="text-[10px] text-stone-500 mt-2">⓵ Tempo de cada fase é cronometrado automaticamente entre o check da fase e o da fase anterior.</p>
     <div class="text-right mt-4"><button class="btn" onclick="fecharModal()">Fechar</button></div>
   `);
 }
