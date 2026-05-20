@@ -2353,97 +2353,51 @@ function abrirModalNovoPedido() {
   // NOTA: o usuário pediu "sempre perguntar, sem default" — por isso não pré-marcamos
 }
 
-// ----- Adicionar item: EMBALAGEM DO ESTOQUE (embalagem + opcionalmente produto) -----
+// ----- Adicionar item: EMBALAGEM DO ESTOQUE (só a embalagem, independente) -----
 function addItemPedidoEmbalagem() {
   const embalagensComSaldo = state.insumos.filter(i =>
     ['EMBALAGEM_PRIMARIA','EMBALAGEM_SECUNDARIA','EMBALAGEM_PROPORCIONAL'].includes(i.tipo) && i.saldo > 0
   );
   if (embalagensComSaldo.length === 0) {
-    toast('Nenhuma embalagem com saldo em estoque · cadastre no módulo de insumos ou use "+ Item fracionado"', 'erro');
+    toast('Nenhuma embalagem com saldo em estoque · cadastre no módulo de insumos primeiro', 'erro');
     return;
   }
   const idx = ++window._pedItemIdx;
   const embInicial = embalagensComSaldo[0];
-  // Sem produto por padrão — vendedor decide se quer adicionar
+  const precoInicial = precoSugeridoEmbalagem(embInicial.id);
   const row = document.createElement('div');
   row.className = 'pedido-item';
   row.dataset.idx = idx;
   row.dataset.modo = 'EMBALAGEM';
-  row.innerHTML = renderItemEmbalagem(idx, embInicial.id, '', null, 1, 0);
+  row.innerHTML = renderItemEmbalagem(idx, embInicial.id, 1, precoInicial);
   document.getElementById('pedido-itens').appendChild(row);
   document.getElementById('pedido-itens-vazio').style.display = 'none';
   if (typeof lucide!=='undefined') lucide.createIcons();
-  recalcularPrecoEmbalagem(idx);
+  atualizarResumoPedido();
 }
 
-// Calcula preço sugerido = (CMP embalagem × (1+markupEmb/100)) + custo_produto_na_gramatura × markup_normal
-function precoSugeridoEmbalagem(embalagemId, produtoId, gramatura) {
+// Preço sugerido = CMP da embalagem × (1 + markupEmbalagem/100)
+function precoSugeridoEmbalagem(embalagemId) {
   const emb = state.insumos.find(i => i.id === embalagemId);
   if (!emb) return 0;
   const markupEmb = 1 + (Number(state.markup.markupEmbalagem) || 30) / 100;
-  let preco = (Number(emb.cmp) || 0) * markupEmb;
-  if (produtoId && gramatura > 0) {
-    const prod = state.produtos.find(p => p.id === produtoId);
-    const r = state.receitas.find(rec => rec.produtoId === produtoId && rec.ativa);
-    if (prod && r) {
-      const custo = calcularCustoReceita(r.id);
-      if (custo) {
-        const custoProdGramatura = custo.custoTotal * (gramatura / (prod.pesoLiq || 500));
-        // Aplica o markup do produto (modo do módulo 3)
-        preco += calcularPrecoSugerido(custoProdGramatura);
-      }
-    }
-  }
-  return Math.round(preco * 10) / 10; // arredonda a R$ 0,10
+  return Math.round((Number(emb.cmp) || 0) * markupEmb * 10) / 10; // arredonda a R$ 0,10
 }
 
-function renderItemEmbalagem(idx, embalagemId, produtoId, gramatura, qtd, preco) {
+function renderItemEmbalagem(idx, embalagemId, qtd, preco) {
   const embalagensComSaldo = state.insumos.filter(i =>
     ['EMBALAGEM_PRIMARIA','EMBALAGEM_SECUNDARIA','EMBALAGEM_PROPORCIONAL'].includes(i.tipo) && i.saldo > 0
   );
   const emb = state.insumos.find(i => i.id === embalagemId);
-  const prod = produtoId ? state.produtos.find(p => p.id === produtoId) : null;
   const tipoLabel = {
     'EMBALAGEM_PRIMARIA':'primária',
     'EMBALAGEM_SECUNDARIA':'secundária',
     'EMBALAGEM_PROPORCIONAL':'proporcional'
   }[emb?.tipo] || '';
   const markupEmb = Number(state.markup.markupEmbalagem) || 30;
-
-  // Chips de gramatura SÓ aparecem se houver produto selecionado
-  let blocoGramatura = '';
-  if (prod) {
-    const peso = prod.pesoLiq || 500;
-    const chips = [];
-    for (let g = 50; g <= peso; g += 50) {
-      const ePesoCompleto = g === peso;
-      chips.push({ g, label: g + 'g', destaque: ePesoCompleto, sub: ePesoCompleto ? 'embal.' : '' });
-    }
-    [2,3,4,5].forEach(m => {
-      chips.push({ g: peso*m, label: (peso*m)+'g', sub: m+'× embal.', destaque: false });
-    });
-    blocoGramatura = `
-      <div class="mb-2">
-        <p class="text-[10px]" style="color:#04342C;">Gramatura do produto (a cada 50g)</p>
-        <div id="chips-emb-${idx}" class="grid gap-1 mt-1" style="grid-template-columns: repeat(6, 1fr);">
-          ${chips.map(c => {
-            const ativo = gramatura && Number(gramatura) === c.g;
-            let style = 'cursor:pointer; border-radius:6px; text-align:center; padding:5px 3px;';
-            if (ativo) style += ' border:2px solid #534AB7; background:#EEEDFE;';
-            else if (c.destaque) style += ' border:1px solid #1D9E75; background:#fff;';
-            else style += ' border:1px solid #D9D5CE; background:#fff;';
-            const corLabel = ativo ? '#26215C' : (c.destaque ? '#04342C' : '#1F1E1D');
-            return `
-              <div class="chip-emb-g" style="${style}" onclick="selecionarGramaturaEmbalagem(${idx}, ${c.g})">
-                <p class="text-xs font-medium" style="color:${corLabel}; margin:0;">${c.label}${ativo?' ✓':''}</p>
-                ${c.sub ? `<p class="text-[9px]" style="color:#6B6967; margin:0;">${c.sub}</p>` : ''}
-              </div>
-            `;
-          }).join('')}
-        </div>
-      </div>
-    `;
-  }
+  const cmpEmb = Number(emb?.cmp) || 0;
+  const valorComMarkup = cmpEmb * (1 + markupEmb/100);
+  const margemPct = preco > 0 ? ((preco - cmpEmb) / preco) * 100 : 0;
 
   return `
     <div class="border rounded-md p-3" style="border-color:#1D9E75; background:#E1F5EE;">
@@ -2472,26 +2426,8 @@ function renderItemEmbalagem(idx, embalagemId, produtoId, gramatura, qtd, preco)
         </div>
       </div>
 
-      <div class="grid gap-2 mb-2" style="grid-template-columns: 2fr 90px;">
-        <div>
-          <p class="text-[10px]" style="color:#04342C;">Produto que vai dentro (opcional)</p>
-          <select name="produtoId_${idx}" class="input text-xs"
-            onchange="recalcularPrecoEmbalagem(${idx})">
-            <option value="">— sem produto (só a embalagem) —</option>
-            ${state.produtos.map(p => `
-              <option value="${p.id}" ${p.id===produtoId?'selected':''}>${p.nome} (saldo PA ${fmtNum(p.saldoPa, 2)})</option>
-            `).join('')}
-          </select>
-        </div>
-        <div>
-          <p class="text-[10px]" style="color:#04342C;">Saldo PA</p>
-          <p class="num font-medium text-sm" style="color:#04342C; padding-top:6px;">${prod ? fmtNum(prod.saldoPa, 2) + ' un' : '—'}</p>
-        </div>
-      </div>
-
-      ${blocoGramatura}
-
-      <input type="hidden" name="gramatura_${idx}" value="${gramatura || (prod?.pesoLiq || 0)}">
+      <input type="hidden" name="produtoId_${idx}" value="">
+      <input type="hidden" name="gramatura_${idx}" value="0">
       <input type="hidden" name="modo_${idx}" value="EMBALAGEM">
 
       <div class="grid gap-2" style="grid-template-columns: 90px 130px 1fr;">
@@ -2513,69 +2449,21 @@ function renderItemEmbalagem(idx, embalagemId, produtoId, gramatura, qtd, preco)
 
       <p class="text-[11px] mt-2" id="composicao-emb-${idx}" style="color:#0F6E56;">
         <i data-lucide="info" class="w-3 h-3 inline"></i>
-        Tipo: ${tipoLabel} · ${prod ? 'com produto' : 'só embalagem'} · markup embalagem ${markupEmb}%
+        ${tipoLabel} · CMP ${fmtBRL(cmpEmb)} × ${(1+markupEmb/100).toFixed(2)} = ${fmtBRL(valorComMarkup)} sugerido · margem ${margemPct.toFixed(1)}%
       </p>
     </div>
   `;
-}
-
-function selecionarGramaturaEmbalagem(idx, gramatura) {
-  const row = document.querySelector(`.pedido-item[data-idx="${idx}"]`);
-  if (!row) return;
-  row.querySelector(`[name="gramatura_${idx}"]`).value = gramatura;
-  recalcularPrecoEmbalagem(idx);
 }
 
 function recalcularPrecoEmbalagem(idx) {
   const row = document.querySelector(`.pedido-item[data-idx="${idx}"]`);
   if (!row) return;
   const embId = row.querySelector(`[name="embalagemId_${idx}"]`).value;
-  const prodId = row.querySelector(`[name="produtoId_${idx}"]`).value || '';
   const qtd = parseFloat(row.querySelector(`[name="qtd_${idx}"]`).value) || 1;
-  let gramatura = parseFloat(row.querySelector(`[name="gramatura_${idx}"]`).value) || 0;
-  // Se trocou para um produto novo e gramatura ainda não foi escolhida, usa o pesoLiq do produto
-  if (prodId) {
-    const prod = state.produtos.find(p => p.id === prodId);
-    if (prod && (!gramatura || gramatura <= 0)) gramatura = prod.pesoLiq || 500;
-  } else {
-    gramatura = 0; // sem produto, sem gramatura
-  }
-  const precoSugerido = precoSugeridoEmbalagem(embId, prodId, gramatura);
-  row.innerHTML = renderItemEmbalagem(idx, embId, prodId, gramatura, qtd, precoSugerido);
+  const precoSugerido = precoSugeridoEmbalagem(embId);
+  row.innerHTML = renderItemEmbalagem(idx, embId, qtd, precoSugerido);
   if (typeof lucide!=='undefined') lucide.createIcons();
-  atualizarComposicaoEmbalagem(idx);
   atualizarResumoPedido();
-}
-
-function atualizarComposicaoEmbalagem(idx) {
-  const row = document.querySelector(`.pedido-item[data-idx="${idx}"]`);
-  if (!row) return;
-  const box = document.getElementById(`composicao-emb-${idx}`);
-  if (!box) return;
-  const embId = row.querySelector(`[name="embalagemId_${idx}"]`).value;
-  const prodId = row.querySelector(`[name="produtoId_${idx}"]`).value || '';
-  const emb = state.insumos.find(i => i.id === embId);
-  const prod = prodId ? state.produtos.find(p => p.id === prodId) : null;
-  if (!emb) return;
-  const gramatura = parseFloat(row.querySelector(`[name="gramatura_${idx}"]`).value) || 0;
-  const preco = parseFloat(row.querySelector(`[name="preco_${idx}"]`).value) || 0;
-  const markupEmb = Number(state.markup.markupEmbalagem) || 30;
-  const cmpEmb = Number(emb.cmp) || 0;
-  const valorEmbComMarkup = cmpEmb * (1 + markupEmb/100);
-  let custoProd = 0;
-  if (prod && gramatura > 0) {
-    const r = state.receitas.find(rec => rec.produtoId === prod.id && rec.ativa);
-    if (r) custoProd = calcularCustoReceita(r.id).custoTotal * (gramatura / (prod.pesoLiq || 500));
-  }
-  const custoTotal = cmpEmb + custoProd;
-  const margemRS = preco - custoTotal;
-  const margemPct = preco > 0 ? (margemRS / preco) * 100 : 0;
-  const tipoLabel = {EMBALAGEM_PRIMARIA:'primária',EMBALAGEM_SECUNDARIA:'secundária',EMBALAGEM_PROPORCIONAL:'proporcional'}[emb.tipo] || '';
-  box.innerHTML = `
-    <i data-lucide="info" class="w-3 h-3 inline"></i>
-    ${tipoLabel} · emb. ${fmtBRL(cmpEmb)} × ${(1+markupEmb/100).toFixed(2)} = ${fmtBRL(valorEmbComMarkup)}${prod ? ' + produto ' + gramatura + 'g (custo ' + fmtBRL(custoProd) + ')' : ''} · margem total ${margemPct.toFixed(1)}%
-  `;
-  if (typeof lucide!=='undefined') lucide.createIcons();
 }
 
 
