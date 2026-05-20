@@ -9,6 +9,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..700&family=Geist:wght@300..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lucide@latest"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
   tailwind.config = {
     theme: {
@@ -85,18 +86,305 @@
 // ============================================================================
 
 const STORAGE_KEY = 'sequilhopro_state_v1';
+
+// ============================================================================
+// SUPABASE — Configuração e camada de sincronização
+// ============================================================================
+const SUPABASE_URL = 'https://gnsipezzrrywnukjnovj.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imduc2lwZXp6cnJ5d251a2pub3ZqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4OTU1NzgsImV4cCI6MjA5NDQ3MTU3OH0.YVngu9wEuEjS1NfJ4LDvwMSyEIsa8bE1-y8xzykKCjQ';
+let sb = null;
+let _syncTimer = null;
+let _dirtyTables = new Set();
+let _syncInProgress = false;
+
+function initSupabase() {
+  if (typeof supabase === 'undefined') {
+    console.warn('Supabase JS não carregou — verifique conexão');
+    return false;
+  }
+  sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: { persistSession: true, autoRefreshToken: true }
+  });
+  return true;
+}
+
+// ----- Conversor de campos: camelCase ↔ snake_case --------------------------
+// Mapeamento de campos que precisam ser renomeados ao salvar/carregar.
+// allowed = lista das colunas que EXISTEM na tabela do Supabase.
+// Tudo fora dessa lista é IGNORADO ao salvar (mas continua em state em memória).
+const FIELD_MAPS = {
+  empresa: {
+    allowed: ['id','razao_social','nome_fantasia','cnpj','ie','regime','faixa_simples','ncm_padrao','cfop_padrao','endereco','contato','nfe_serie','nfe_proximo_numero'],
+    toDb:   { razaoSocial:'razao_social', nomeFantasia:'nome_fantasia', faixaSimples:'faixa_simples', ncmPadrao:'ncm_padrao', cfopPadrao:'cfop_padrao', nfeSerie:'nfe_serie', nfeProximoNumero:'nfe_proximo_numero' },
+    fromDb: { razao_social:'razaoSocial', nome_fantasia:'nomeFantasia', faixa_simples:'faixaSimples', ncm_padrao:'ncmPadrao', cfop_padrao:'cfopPadrao', nfe_serie:'nfeSerie', nfe_proximo_numero:'nfeProximoNumero' }
+  },
+  markup: {
+    allowed: ['id','modo','df','dv','ml','producao_mensal','custo_fixo_mes','custo_variavel_mes','margem_liquida_mes','markup_embalagem'],
+    toDb:   { producaoMensal:'producao_mensal', custoFixoMes:'custo_fixo_mes', custoVariavelMes:'custo_variavel_mes', margemLiquidaMes:'margem_liquida_mes', markupEmbalagem:'markup_embalagem' },
+    fromDb: { producao_mensal:'producaoMensal', custo_fixo_mes:'custoFixoMes', custo_variavel_mes:'custoVariavelMes', margem_liquida_mes:'margemLiquidaMes', markup_embalagem:'markupEmbalagem' }
+  },
+  produtos: {
+    allowed: ['id','sku','nome','ncm','peso_liq','saldo_pa','minimo_pa'],
+    toDb:   { pesoLiq:'peso_liq', saldoPa:'saldo_pa', minimoPa:'minimo_pa' },
+    fromDb: { peso_liq:'pesoLiq', saldo_pa:'saldoPa', minimo_pa:'minimoPa' }
+  },
+  receitas: {
+    allowed: ['id','produto_id','ativa','rendimento_un','tempo_h','taxa_mod','depreciacao','itens'],
+    toDb:   { produtoId:'produto_id', rendimentoUn:'rendimento_un', tempoH:'tempo_h', taxaMod:'taxa_mod' },
+    fromDb: { produto_id:'produtoId', rendimento_un:'rendimentoUn', tempo_h:'tempoH', taxa_mod:'taxaMod' }
+  },
+  clientes: {
+    allowed: ['id','nome','tipo','telefone','email','cidade','uf','prazo_dias','documento','limite_credito','forma_pagto'],
+    toDb:   { prazoDias:'prazo_dias', limiteCredito:'limite_credito', formaPagto:'forma_pagto' },
+    fromDb: { prazo_dias:'prazoDias', limite_credito:'limiteCredito', forma_pagto:'formaPagto' }
+  },
+  fornecedores: {
+    allowed: ['id','nome','cnpj','telefone','email','origem','lead_time','score','preferencial','pedido_minimo','prazo_pagto'],
+    toDb:   { leadTime:'lead_time', pedidoMinimo:'pedido_minimo', prazoPagto:'prazo_pagto' },
+    fromDb: { lead_time:'leadTime', pedido_minimo:'pedidoMinimo', prazo_pagto:'prazoPagto' }
+  },
+  fornecedorInsumos: {
+    table:  'fornecedor_insumos',
+    allowed: ['id','fornecedor_id','insumo_id','preco'],
+    toDb:   { fornecedorId:'fornecedor_id', insumoId:'insumo_id' },
+    fromDb: { fornecedor_id:'fornecedorId', insumo_id:'insumoId' }
+  },
+  movimentos: {
+    allowed: ['id','insumo_id','tipo','qtd','custo_unit','obs','data'],
+    toDb:   { insumoId:'insumo_id', custoUnit:'custo_unit' },
+    fromDb: { insumo_id:'insumoId', custo_unit:'custoUnit' }
+  },
+  pedidos: {
+    allowed: ['id','numero','tipo','cliente_id','canal','status_comercial','status_produtivo','criado_em','data_entrega','subtotal','total','bonificacao','custo_snapshot','itens','forma_pagto','prazo_dias'],
+    toDb:   { clienteId:'cliente_id', statusComercial:'status_comercial', statusProdutivo:'status_produtivo', criadoEm:'criado_em', dataEntrega:'data_entrega', custoSnapshot:'custo_snapshot', formaPagto:'forma_pagto', prazoDias:'prazo_dias' },
+    fromDb: { cliente_id:'clienteId', status_comercial:'statusComercial', status_produtivo:'statusProdutivo', criado_em:'criadoEm', data_entrega:'dataEntrega', custo_snapshot:'custoSnapshot', forma_pagto:'formaPagto', prazo_dias:'prazoDias' }
+  },
+  ordens: {
+    allowed: ['id','numero','produto_id','tamanho_lote','status','programada_para','iniciada_em','concluida_em','custo_total','custo_unitario','pedido_origem_id','fases'],
+    toDb:   { produtoId:'produto_id', tamanhoLote:'tamanho_lote', programadaPara:'programada_para', iniciadaEm:'iniciada_em', concluidaEm:'concluida_em', custoTotal:'custo_total', custoUnitario:'custo_unitario', pedidoOrigemId:'pedido_origem_id' },
+    fromDb: { produto_id:'produtoId', tamanho_lote:'tamanhoLote', programada_para:'programadaPara', iniciada_em:'iniciadaEm', concluida_em:'concluidaEm', custo_total:'custoTotal', custo_unitario:'custoUnitario', pedido_origem_id:'pedidoOrigemId' }
+  },
+  contasReceber: {
+    table:  'contas_receber',
+    allowed: ['id','pedido_id','descricao','valor','vencimento','status','pago_em'],
+    toDb:   { pedidoId:'pedido_id', pagoEm:'pago_em' },
+    fromDb: { pedido_id:'pedidoId', pago_em:'pagoEm' }
+  },
+  contasPagar: {
+    table:  'contas_pagar',
+    allowed: ['id','descricao','valor','vencimento','status','categoria','pago_em'],
+    toDb:   { pagoEm:'pago_em' },
+    fromDb: { pago_em:'pagoEm' }
+  },
+  insumos: {
+    allowed: ['id','nome','tipo','unidade','cmp','saldo','minimo','ncm'],
+    toDb: {},
+    fromDb: {}
+  },
+  logs: {
+    allowed: ['id','modulo','acao','alvo_id','detalhe','data'],
+    toDb:   { alvoId:'alvo_id', entidadeId:'alvo_id', detalhes:'detalhe', criadoEm:'data' },
+    fromDb: { alvo_id:'alvoId', detalhe:'detalhes', data:'criadoEm' }
+  },
+};
+
+// Lista de chaves em state que sincronizam (em ordem para respeitar foreign keys)
+const SYNC_ORDER = ['insumos','produtos','receitas','clientes','fornecedores','fornecedorInsumos','movimentos','pedidos','ordens','contasReceber','contasPagar','logs'];
+
+function tableName(stateKey) {
+  return FIELD_MAPS[stateKey]?.table || stateKey;
+}
+
+function toDbRow(stateKey, obj) {
+  const cfg = FIELD_MAPS[stateKey] || {};
+  const map = cfg.toDb || {};
+  const allowed = cfg.allowed || null;
+  const out = {};
+  for (const k in obj) {
+    const dbKey = map[k] || k;
+    // Se temos lista de permitidos, filtra
+    if (allowed && !allowed.includes(dbKey)) continue;
+    out[dbKey] = obj[k];
+  }
+  return out;
+}
+
+function fromDbRow(stateKey, obj) {
+  const map = FIELD_MAPS[stateKey]?.fromDb || {};
+  const out = {};
+  for (const k in obj) {
+    const jsKey = map[k] || k;
+    out[jsKey] = obj[k];
+  }
+  // Remove campo created_at (não usado no app)
+  delete out.created_at;
+  return out;
+}
+
+// ----- Autenticação ---------------------------------------------------------
+async function checkAuth() {
+  if (!sb) return null;
+  const { data: { session } } = await sb.auth.getSession();
+  return session?.user || null;
+}
+
+async function loginUser(email, password) {
+  if (!sb) throw new Error('Supabase não inicializado');
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) throw error;
+  return data.user;
+}
+
+async function logoutUser() {
+  if (!sb) return;
+  await sb.auth.signOut();
+  location.reload();
+}
+
+// ----- Carregar tudo do Supabase para state -------------------------------
+async function carregarStateDoSupabase() {
+  if (!sb) throw new Error('Supabase não inicializado');
+  const novoState = seedData(); // estrutura base
+
+  // Empresa (linha única)
+  const { data: emp } = await sb.from('empresa').select('*').eq('id','main').single();
+  if (emp) Object.assign(novoState.empresa, fromDbRow('empresa', emp));
+
+  // Markup (linha única)
+  const { data: mk } = await sb.from('markup').select('*').eq('id','main').single();
+  if (mk) Object.assign(novoState.markup, fromDbRow('markup', mk));
+
+  // Arrays
+  for (const key of SYNC_ORDER) {
+    const t = tableName(key);
+    const { data, error } = await sb.from(t).select('*');
+    if (error) { console.error('Erro ao carregar', t, error); continue; }
+    novoState[key] = (data || []).map(r => fromDbRow(key, r));
+  }
+  return novoState;
+}
+
+// ----- Sincronizar UMA tabela (lê do state e faz upsert) -------------------
+async function sincronizarTabela(stateKey) {
+  if (!sb) return;
+  const t = tableName(stateKey);
+  if (stateKey === 'empresa' || stateKey === 'markup') {
+    const row = toDbRow(stateKey, { id:'main', ...state[stateKey] });
+    const { error } = await sb.from(t).upsert(row);
+    if (error) console.error('Erro upsert', t, error);
+    return;
+  }
+  // Array: pegar IDs atuais no banco e comparar com state
+  const itens = state[stateKey] || [];
+  if (itens.length === 0) {
+    // Apagar tudo desta tabela
+    const { error } = await sb.from(t).delete().neq('id','___nunca___');
+    if (error) console.error('Erro delete', t, error);
+    return;
+  }
+  // Upsert em batch
+  const rows = itens.map(it => toDbRow(stateKey, it));
+  const { error: upErr } = await sb.from(t).upsert(rows);
+  if (upErr) console.error('Erro upsert', t, upErr);
+  // Apagar registros que sumiram do state
+  const idsAtuais = itens.map(i => i.id);
+  const { data: nbanco } = await sb.from(t).select('id');
+  const aRemover = (nbanco || []).map(r => r.id).filter(id => !idsAtuais.includes(id));
+  if (aRemover.length > 0) {
+    const { error: delErr } = await sb.from(t).delete().in('id', aRemover);
+    if (delErr) console.error('Erro delete subset', t, delErr);
+  }
+}
+
+// ----- Sincronizar tudo (chamado em background pelo debounce) -------------
+async function sincronizarTudo() {
+  if (!sb || _syncInProgress) return;
+  _syncInProgress = true;
+  mostrarStatusSync('sincronizando');
+  try {
+    const tabelas = Array.from(_dirtyTables);
+    _dirtyTables.clear();
+    for (const key of tabelas) {
+      await sincronizarTabela(key);
+    }
+    mostrarStatusSync('ok');
+  } catch (e) {
+    console.error('Erro de sync:', e);
+    mostrarStatusSync('erro');
+  } finally {
+    _syncInProgress = false;
+  }
+}
+
+// Marca tabelas como "sujas" e agenda sync (debounce 800ms)
+function marcarSujo(stateKey) {
+  _dirtyTables.add(stateKey);
+  if (_syncTimer) clearTimeout(_syncTimer);
+  _syncTimer = setTimeout(sincronizarTudo, 800);
+}
+
+function marcarTudoSujo() {
+  ['empresa','markup', ...SYNC_ORDER].forEach(k => _dirtyTables.add(k));
+  if (_syncTimer) clearTimeout(_syncTimer);
+  _syncTimer = setTimeout(sincronizarTudo, 800);
+}
+
+function mostrarStatusSync(estado) {
+  const el = document.getElementById('sync-status');
+  if (!el) return;
+  const map = {
+    'sincronizando': { txt:'Salvando…', cor:'#BA7517', bg:'#FAEEDA' },
+    'ok':            { txt:'Salvo na nuvem ✓', cor:'#04342C', bg:'#E1F5EE' },
+    'erro':          { txt:'Erro ao salvar', cor:'#501313', bg:'#FCEBEB' }
+  };
+  const c = map[estado] || map.ok;
+  el.style.cssText = `background:${c.bg}; color:${c.cor}; padding:2px 8px; border-radius:4px; font-size:11px;`;
+  el.textContent = c.txt;
+  if (estado === 'ok') {
+    setTimeout(() => { if (el.textContent === c.txt) el.textContent = ''; el.style.cssText = ''; }, 2000);
+  }
+}
+
+
 const fmtBRL = v => 'R$ ' + (Number(v)||0).toLocaleString('pt-BR', {minimumFractionDigits:2, maximumFractionDigits:2});
 const fmtNum = (v, d=3) => (Number(v)||0).toLocaleString('pt-BR', {minimumFractionDigits:0, maximumFractionDigits:d});
+
+// Parse de data tipo "YYYY-MM-DD" como fuso LOCAL (evita o bug do UTC).
+// Quando JS recebe "2026-05-19" e faz new Date(), interpreta como meia-noite UTC.
+// Em BR (UTC−3) isso vira 18/05 21h — exibe 1 dia antes. Esta função corrige.
+function parseDataBR(s) {
+  if (!s) return null;
+  if (s instanceof Date) return s;
+  if (typeof s !== 'string') return new Date(s);
+  // String "YYYY-MM-DD" pura (sem horário) → criar como data local
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+  // String com horário (ISO completo) — JS já interpreta certo
+  return new Date(s);
+}
+
 const fmtDate = d => {
-  const dt = (typeof d === 'string') ? new Date(d) : d;
+  const dt = parseDataBR(d);
+  if (!dt) return '';
   return dt.toLocaleDateString('pt-BR');
 };
 const fmtDateTime = d => {
-  const dt = (typeof d === 'string') ? new Date(d) : d;
+  const dt = parseDataBR(d);
+  if (!dt) return '';
   return dt.toLocaleString('pt-BR', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' });
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
-const todayISO = () => new Date().toISOString().slice(0,10);
+const todayISO = () => {
+  // Data de hoje em fuso LOCAL como "YYYY-MM-DD"
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+};
+// Adiciona N dias a uma data string "YYYY-MM-DD" (sem bug de fuso)
+function addDaysISO(dataISO, dias) {
+  const dt = parseDataBR(dataISO) || new Date();
+  dt.setDate(dt.getDate() + (Number(dias) || 0));
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+}
 
 // Simple SHA-256 for audit hashing (Web Crypto API)
 async function sha256(str) {
@@ -106,150 +394,93 @@ async function sha256(str) {
 }
 
 // ============================================================================
-// SEED — Initial data matching Sequilhos da Vovó Cida demo
+// SEED — Initial data matching Pitchu Doces demo
 // ============================================================================
 function seedData() {
   return {
     empresa: {
-      razaoSocial: 'Doce Sabor Indústria de Biscoitos LTDA',
-      nomeFantasia: 'Sequilhos da Vovó Cida',
-      cnpj: '31.452.876/0001-04',
-      ie: '10.487.392-1',
+      razaoSocial: '',
+      nomeFantasia: '',
+      cnpj: '',
+      ie: '',
       regime: 'SIMPLES_NACIONAL',
-      faixaSimples: 7.3,
+      faixaSimples: 0,
       ncmPadrao: '1905.31.00',
       cfopPadrao: '5101',
-      endereco: { logradouro: 'R. das Acácias, 412 - Galpão B', bairro: 'Setor Bueno', municipio: 'Goiânia', uf: 'GO', cep: '74825-100' },
-      contato: { responsavel: 'Aparecida Souza', telefone: '(62) 3251-7700', whatsapp: '(62) 9 8451-2378', email: 'contato@sequilhosvovocida.com.br' },
+      endereco: { logradouro: '', bairro: '', municipio: '', uf: '', cep: '' },
+      contato: { responsavel: '', telefone: '', whatsapp: '', email: '' },
       nfeSerie: 1,
-      nfeProximoNumero: 47,
+      nfeProximoNumero: 1,
     },
-    usuarioAtual: { id: 'u1', nome: 'Aparecida Souza', email: 'aparecida@sequilhosvovocida.com.br', perfil: 'proprietario' },
+    usuarioAtual: { id: 'u1', nome: 'Amanda Cecílio', email: 'amanda.cecilio@hotmail.com', perfil: 'proprietario' },
     usuarios: [
-      { id: 'u1', nome: 'Aparecida Souza', email: 'aparecida@sequilhosvovocida.com.br', perfil: 'proprietario', ativo: true },
+      { id: 'u1', nome: 'Amanda Cecílio', email: 'amanda.cecilio@hotmail.com', perfil: 'proprietario', ativo: true },
     ],
     permissoes: {
       proprietario: { '01':2,'02':2,'03':2,'05':2,'06':2,'07':2,'08':2,'09':2,'10':2,'11':2,'13':2,'15':2 },
     },
-    insumos: [
-      { id:'i1', nome:'Amido de milho', tipo:'INGREDIENTE', unidade:'g', cmp:0.00764, saldo:42000, minimo:10000, ncm:'1108.12.00' },
-      { id:'i2', nome:'Gordura vegetal', tipo:'INGREDIENTE', unidade:'g', cmp:0.01455, saldo:18000, minimo:5000, ncm:'1517.90.10' },
-      { id:'i3', nome:'Açúcar refinado', tipo:'INGREDIENTE', unidade:'g', cmp:0.00487, saldo:25000, minimo:8000, ncm:'1701.99.00' },
-      { id:'i4', nome:'Ovo pasteurizado', tipo:'INGREDIENTE', unidade:'g', cmp:0.01840, saldo:8000, minimo:2000, ncm:'0408.99.00' },
-      { id:'i5', nome:'Aroma + sal', tipo:'INGREDIENTE', unidade:'g', cmp:0.04200, saldo:1200, minimo:300, ncm:'3302.10.00' },
-      { id:'i6', nome:'Saco BOPP 500g', tipo:'EMBALAGEM_PRIMARIA', unidade:'un', cmp:0.39, saldo:85, minimo:50, ncm:'3923.21.10' },
-      { id:'i7', nome:'Etiqueta PEPS', tipo:'EMBALAGEM_PRIMARIA', unidade:'un', cmp:0.07, saldo:220, minimo:100, ncm:'4821.10.00' },
-      { id:'i8', nome:'Caixa master', tipo:'EMBALAGEM_PROPORCIONAL', unidade:'un', cmp:2.90, saldo:8, minimo:10, ncm:'4819.10.00' },
-    ],
-    produtos: [
-      { id:'p1', sku:'SQ-001', nome:'Sequilho clássico 500g', ncm:'1905.31.00', pesoLiq:500, saldoPa:142, minimoPa:50 },
-      { id:'p2', sku:'SQ-002', nome:'Sequilho chocolate 500g', ncm:'1905.31.00', pesoLiq:500, saldoPa:36, minimoPa:50 },
-      { id:'p3', sku:'SQ-003', nome:'Sequilho coco 500g', ncm:'1905.31.00', pesoLiq:500, saldoPa:78, minimoPa:30 },
-    ],
-    receitas: [
-      { id:'r1', produtoId:'p1', versao:1, rendimentoUn:1, tempoH:0.18, taxaMod:22.50, depreciacao:2.22, ativa:true, criadoEm:'2025-08-15',
-        itens: [
-          { insumoId:'i1', qtd:220, unidade:'g' },
-          { insumoId:'i2', qtd:120, unidade:'g' },
-          { insumoId:'i3', qtd:90, unidade:'g' },
-          { insumoId:'i4', qtd:35, unidade:'g' },
-          { insumoId:'i5', qtd:5, unidade:'g' },
-          { insumoId:'i6', qtd:1, unidade:'un' },
-          { insumoId:'i7', qtd:1, unidade:'un' },
-          { insumoId:'i8', qtd:0.125, unidade:'un' },
-        ]},
-    ],
-    clientes: [
-      { id:'c1', tipo:'B2B', documento:'12.345.678/0001-90', nome:'Padaria Estrela do Sul', telefone:'(62) 3441-1100', cidade:'Goiânia/GO', prazoDias:14, limiteCredito:6000, formaPagto:'boleto', criadoEm:'2024-03-12' },
-      { id:'c2', tipo:'B2B', documento:'23.456.789/0001-12', nome:'Mercearia Bom Preço', telefone:'(62) 3271-5544', cidade:'Aparecida de Goiânia/GO', prazoDias:21, limiteCredito:4000, formaPagto:'boleto', criadoEm:'2024-05-22' },
-      { id:'c3', tipo:'B2B', documento:'34.567.890/0001-23', nome:'Empório Sabor Goiano', telefone:'(62) 3299-7788', cidade:'Goiânia/GO', prazoDias:28, limiteCredito:8000, formaPagto:'boleto', criadoEm:'2023-11-08' },
-      { id:'c4', tipo:'B2C', documento:'123.456.789-00', nome:'Maria Helena Souza', telefone:'(62) 9 8123-4567', cidade:'Goiânia/GO', prazoDias:0, limiteCredito:0, formaPagto:'pix', criadoEm:'2025-01-15' },
-      { id:'c5', tipo:'B2C', documento:'987.654.321-00', nome:'Roberto Lima', telefone:'(62) 9 9876-5432', cidade:'Trindade/GO', prazoDias:0, limiteCredito:0, formaPagto:'pix', criadoEm:'2025-02-03' },
-    ],
-    fornecedores: [
-      { id:'f1', cnpj:'45.123.456/0001-78', nome:'Cerealista Goiás LTDA', origem:'Goiânia/GO', leadTime:3, pedidoMinimo:500, prazoPagto:'21/35/49', score:94, telefone:'(62) 3201-2200', email:'vendas@cerealistagoias.com.br', preferencial:true },
-      { id:'f2', cnpj:'56.234.567/0001-89', nome:'Trigo Real Distribuidora', origem:'Anápolis/GO', leadTime:5, pedidoMinimo:800, prazoPagto:'28/42', score:78, telefone:'(62) 3318-4400', email:'comercial@trigoreal.com.br', preferencial:false },
-      { id:'f3', cnpj:'67.345.678/0001-90', nome:'Embalagens Cerrado', origem:'Goiânia/GO', leadTime:2, pedidoMinimo:200, prazoPagto:'14', score:88, telefone:'(62) 3242-9900', email:'contato@embalcerrado.com.br', preferencial:true },
-      { id:'f4', cnpj:'78.456.789/0001-01', nome:'Açúcar e Cia', origem:'Itumbiara/GO', leadTime:4, pedidoMinimo:300, prazoPagto:'21/42', score:82, telefone:'(64) 3431-7700', email:'pedidos@acucarecia.com.br', preferencial:false },
-    ],
-    fornecedorInsumos: [
-      { fornecedorId:'f1', insumoId:'i1', preco:0.00738, preferencial:true },
-      { fornecedorId:'f1', insumoId:'i3', preco:0.00487, preferencial:true },
-      { fornecedorId:'f2', insumoId:'i1', preco:0.00845, preferencial:false },
-      { fornecedorId:'f3', insumoId:'i6', preco:0.39, preferencial:true },
-      { fornecedorId:'f3', insumoId:'i7', preco:0.07, preferencial:true },
-      { fornecedorId:'f3', insumoId:'i8', preco:2.90, preferencial:true },
-      { fornecedorId:'f4', insumoId:'i3', preco:0.00512, preferencial:false },
-    ],
-    movimentos: [
-      { id:'m1', insumoId:'i1', tipo:'ENTRADA_NFE', qtd:25000, cmpAplicado:0.00721, saldoApos:42000, data:'2025-04-28T10:30:00', obs:'NF-e 8842/Cerealista Goiás' },
-      { id:'m2', insumoId:'i1', tipo:'ENTRADA_NFE', qtd:15000, cmpAplicado:0.00812, saldoApos:42000, data:'2025-05-02T14:15:00', obs:'NF-e 8901/Cerealista Goiás · alerta +12,6%' },
-      { id:'m3', insumoId:'i2', tipo:'ENTRADA_NFE', qtd:20000, cmpAplicado:0.01455, saldoApos:18000, data:'2025-04-25T09:00:00', obs:'NF-e 4421/Trigo Real' },
-      { id:'m4', insumoId:'i3', tipo:'SAIDA_PRODUCAO', qtd:-9000, cmpAplicado:0.00487, saldoApos:25000, data:'2025-05-08T16:20:00', obs:'OP-237' },
-    ],
-    pedidos: [
-      { id:'pe1', numero:241, clienteId:'c1', canal:'whatsapp', statusComercial:'CONFIRMADO', statusProdutivo:'PRONTO', criadoEm:'2025-05-09T08:30:00', dataEntrega:todayISO(), total:438.00, custoSnapshot:219.80, itens:[ {produtoId:'p1', qtd:12, preco:21.90}, {produtoId:'p3', qtd:8, preco:21.90} ] },
-      { id:'pe2', numero:242, clienteId:'c2', canal:'telefone', statusComercial:'CONFIRMADO', statusProdutivo:'EM_PRODUCAO', criadoEm:'2025-05-09T11:00:00', dataEntrega:todayISO(), total:328.50, custoSnapshot:164.85, itens:[ {produtoId:'p1', qtd:15, preco:21.90} ] },
-      { id:'pe3', numero:243, clienteId:'c3', canal:'representante', statusComercial:'CONFIRMADO', statusProdutivo:'AGUARDANDO', criadoEm:'2025-05-10T09:00:00', dataEntrega:new Date(Date.now()+86400000).toISOString().slice(0,10), total:1095.00, custoSnapshot:549.50, itens:[ {produtoId:'p1', qtd:30, preco:21.90}, {produtoId:'p2', qtd:20, preco:21.90} ] },
-      { id:'pe4', numero:240, clienteId:'c4', canal:'b2c', statusComercial:'PAGO', statusProdutivo:'ENTREGUE', criadoEm:'2025-05-05T15:00:00', dataEntrega:'2025-05-06', total:87.60, custoSnapshot:43.96, itens:[ {produtoId:'p1', qtd:4, preco:21.90} ] },
-    ],
-    ordens: [
-      { id:'op1', numero:237, produtoId:'p1', tamanhoLote:100, status:'CONCLUIDA', programadaPara:'2025-05-08', iniciadaEm:'2025-05-08T07:00:00', concluidaEm:'2025-05-08T14:00:00', custoTotal:1099.00, custoUnitario:10.99,
-        fases: [ {nome:'Pesagem', concluida:true}, {nome:'Mistura', concluida:true}, {nome:'Modelagem', concluida:true}, {nome:'Forneamento', concluida:true}, {nome:'Embalagem', concluida:true} ] },
-      { id:'op2', numero:238, produtoId:'p1', tamanhoLote:100, status:'EM_ANDAMENTO', programadaPara:todayISO(), iniciadaEm:new Date(Date.now()-3600000*2).toISOString(), custoTotal:null, custoUnitario:null,
-        fases: [ {nome:'Pesagem', concluida:true}, {nome:'Mistura', concluida:true}, {nome:'Modelagem', concluida:false}, {nome:'Forneamento', concluida:false}, {nome:'Embalagem', concluida:false} ] },
-      { id:'op3', numero:239, produtoId:'p2', tamanhoLote:80, status:'PROGRAMADA', programadaPara:new Date(Date.now()+86400000).toISOString().slice(0,10), iniciadaEm:null, custoTotal:null, custoUnitario:null,
-        fases: [ {nome:'Pesagem', concluida:false}, {nome:'Mistura', concluida:false}, {nome:'Modelagem', concluida:false}, {nome:'Forneamento', concluida:false}, {nome:'Embalagem', concluida:false} ] },
-    ],
-    contasReceber: [
-      { id:'cr1', pedidoId:'pe1', descricao:'Pedido #241 · Padaria Estrela do Sul', valor:438.00, vencimento:'2025-05-23', status:'ABERTA' },
-      { id:'cr2', pedidoId:'pe2', descricao:'Pedido #242 · Mercearia Bom Preço', valor:328.50, vencimento:'2025-05-30', status:'ABERTA' },
-      { id:'cr3', pedidoId:'pe3', descricao:'Pedido #243 · Empório Sabor Goiano', valor:1095.00, vencimento:'2025-06-07', status:'ABERTA' },
-      { id:'cr4', pedidoId:'pe4', descricao:'Pedido #240 · Maria Helena Souza', valor:87.60, vencimento:'2025-05-05', status:'PAGA', pagoEm:'2025-05-05' },
-    ],
-    contasPagar: [
-      { id:'cp1', fornecedorId:'f1', descricao:'NF 8901 · Cerealista Goiás · Amido', valor:189.50, vencimento:'2025-05-26', status:'ABERTA' },
-      { id:'cp2', fornecedorId:'f3', descricao:'NF 5532 · Embalagens Cerrado', valor:412.00, vencimento:'2025-05-16', status:'ABERTA' },
-      { id:'cp3', fornecedorId:'f1', descricao:'Energia elétrica · Enel', valor:680.00, vencimento:'2025-05-12', status:'ABERTA', categoria:'utilidades' },
-      { id:'cp4', fornecedorId:'f1', descricao:'Salário · João Pedro', valor:1850.00, vencimento:'2025-05-10', status:'PAGA', pagoEm:'2025-05-10', categoria:'folha' },
-    ],
-    logs: [
-      { id:'l1', usuarioId:'u1', modulo:'06_pedido', acao:'CONFIRMADO', entidadeId:'pe1', criadoEm:'2025-05-09T08:32:15', hash:'a3f8...d291', detalhes:'Pedido #241 confirmado · R$ 438,00' },
-      { id:'l2', usuarioId:'u2', modulo:'10_ordem_producao', acao:'INICIADA', entidadeId:'op2', criadoEm:'2025-05-11T07:00:00', hash:'b4f9...e3a2', detalhes:'OP-238 iniciada' },
-      { id:'l3', usuarioId:'u1', modulo:'01_motor_cmp', acao:'ENTRADA_NFE_COM_ALERTA', entidadeId:'i1', criadoEm:'2025-05-02T14:15:30', hash:'c5fa...f4b3', detalhes:'Amido CMP +12,6% (R$ 0,00721 → R$ 0,00812)' },
-      { id:'l4', usuarioId:'u3', modulo:'06_pedido', acao:'RASCUNHO_CRIADO', entidadeId:'pe3', criadoEm:'2025-05-10T09:00:12', hash:'d6fb...05c4', detalhes:'Pedido #243 criado · Empório Sabor Goiano' },
-    ],
-    backups: [
-      { id:'b1', tipo:'AUTOMATICO_DIARIO', tamanho:3458291, criadoEm:'2025-05-10T03:00:00', hash:'e7fc...16d5', retencaoAte:'2030-05-10' },
-      { id:'b2', tipo:'AUTOMATICO_DIARIO', tamanho:3441877, criadoEm:'2025-05-09T03:00:00', hash:'f8fd...27e6', retencaoAte:'2030-05-09' },
-      { id:'b3', tipo:'MENSAL_FISCAL', tamanho:3398410, criadoEm:'2025-04-30T23:55:00', hash:'09fe...38f7', retencaoAte:'2030-04-30' },
-    ],
-    // Markup default — % (slider) e composição em R$/mês rateada por produção mensal estimada
+    insumos: [],
+    produtos: [],
+    receitas: [],
+    clientes: [],
+    fornecedores: [],
+    fornecedorInsumos: [],
+    movimentos: [],
+    pedidos: [],
+    ordens: [],
+    contasReceber: [],
+    contasPagar: [],
+    logs: [],
+    backups: [],
+    // Markup default — defaults sensatos para o proprietário ajustar no primeiro uso
     markup: {
       df: 17, dv: 15, ml: 18,
-      // Composição em R$ (mensal). O sistema rateia pela produção mensal estimada para chegar a R$/un.
-      modo: 'PERCENTUAL', // 'PERCENTUAL' ou 'VALOR_MENSAL'
-      producaoMensal: 1200,        // un/mês estimadas
-      custoFixoMes: 4800,          // R$/mês de despesas fixas (aluguel, energia, salários)
-      custoVariavelMes: 1500,      // R$/mês de variáveis (impostos, comissões, frete)
-      margemLiquidaMes: 3600,      // R$/mês de margem líquida desejada (lucro alvo)
+      modo: 'PERCENTUAL',
+      producaoMensal: 1000,
+      custoFixoMes: 0,
+      custoVariavelMes: 0,
+      margemLiquidaMes: 0,
+      markupEmbalagem: 30, // markup % aplicado sobre o CMP da embalagem ao vender
     },
   };
 }
 
 // ============================================================================
-// STATE MANAGEMENT
-// ============================================================================
-let state = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
-if (!state) { state = seedData(); }
+// STATE MANAGEMENT — agora inicializado de forma assíncrona após login Supabase
+// (o boot do app está no final do arquivo; até lá, state começa como estrutura vazia)
+let state = seedData();
 migrarState();
-persistState();
 
-function persistState() { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
-function resetState() { state = seedData(); migrarState(); persistState(); render(); toast('Dados restaurados ao seed inicial'); }
+// persistState agora salva LOCAL (cache rápido) E marca todas as tabelas para sync com Supabase
+function persistState() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch(e) {}
+  marcarTudoSujo();
+}
+async function resetState() {
+  if (!confirm('Isso vai apagar TODOS os dados (local e nuvem). Continuar?')) return;
+  state = seedData();
+  migrarState();
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch(e) {}
+  marcarTudoSujo();
+  await sincronizarTudo();
+  render();
+  toast('Dados restaurados ao seed inicial');
+}
 
 // Migração de state: preserva dados existentes e injeta campos novos com defaults
 function migrarState() {
+  // 0) Garantir que todos os arrays/objetos críticos existam
+  const arraysObrigatorios = ['usuarios','insumos','produtos','receitas','clientes','fornecedores','fornecedorInsumos','movimentos','pedidos','ordens','contasReceber','contasPagar','logs','backups'];
+  arraysObrigatorios.forEach(k => { if (!Array.isArray(state[k])) state[k] = []; });
+  if (!state.empresa) state.empresa = {
+    razaoSocial:'', nomeFantasia:'', cnpj:'', ie:'', regime:'SIMPLES_NACIONAL',
+    faixaSimples:0, ncmPadrao:'1905.31.00', cfopPadrao:'5101',
+    endereco:{ logradouro:'', bairro:'', municipio:'', uf:'', cep:'' },
+    contato:{ responsavel:'', telefone:'', whatsapp:'', email:'' },
+    nfeSerie:1, nfeProximoNumero:1
+  };
+  if (!state.usuarioAtual) state.usuarioAtual = { id:'u1', nome:'Amanda Cecílio', email:'amanda.cecilio@hotmail.com', perfil:'proprietario' };
+  if (state.usuarios.length === 0) state.usuarios.push({ id:'u1', nome:'Amanda Cecílio', email:'amanda.cecilio@hotmail.com', perfil:'proprietario', ativo:true });
   // 1) Markup — adicionar composição em R$/mês se ainda não existir
   if (!state.markup) state.markup = {};
   if (typeof state.markup.df !== 'number') state.markup.df = 17;
@@ -260,7 +491,8 @@ function migrarState() {
   if (typeof state.markup.custoFixoMes !== 'number') state.markup.custoFixoMes = 4800;
   if (typeof state.markup.custoVariavelMes !== 'number') state.markup.custoVariavelMes = 1500;
   if (typeof state.markup.margemLiquidaMes !== 'number') state.markup.margemLiquidaMes = 3600;
-  // 2) Pedidos — adicionar campo "tipo", gramatura, subtotal e bonificacao
+  if (typeof state.markup.markupEmbalagem !== 'number') state.markup.markupEmbalagem = 30;
+  // 2) Pedidos — adicionar campo "tipo", gramatura, subtotal, bonificacao, modo e embalagemId
   if (Array.isArray(state.pedidos)) {
     state.pedidos.forEach(p => {
       if (!p.tipo) p.tipo = 'ENCOMENDA';
@@ -270,9 +502,10 @@ function migrarState() {
             const prod = state.produtos.find(x => x.id === it.produtoId);
             it.gramatura = prod?.pesoLiq || 500;
           }
+          if (!it.modo) it.modo = 'FRACIONADO';
+          if (typeof it.embalagemId === 'undefined') it.embalagemId = null;
         });
       }
-      // subtotal = soma dos itens sem arredondamento; bonificacao = total − subtotal
       if (typeof p.subtotal !== 'number') {
         p.subtotal = (p.itens || []).reduce((s, i) => s + (i.qtd * i.preco), 0);
       }
@@ -419,6 +652,23 @@ function confirmarPedido(pedidoId) {
     necessario[it.produtoId] = (necessario[it.produtoId] || 0) + unEq;
   });
 
+  // Calcular necessidade de embalagem (itens modo EMBALAGEM)
+  const necessarioEmb = {};
+  p.itens.forEach(it => {
+    if (it.modo === 'EMBALAGEM' && it.embalagemId) {
+      necessarioEmb[it.embalagemId] = (necessarioEmb[it.embalagemId] || 0) + it.qtd;
+    }
+  });
+
+  // Validar saldo de embalagem ANTES de tudo
+  for (const [embId, qtdNec] of Object.entries(necessarioEmb)) {
+    const emb = state.insumos.find(i => i.id === embId);
+    if (!emb || emb.saldo < qtdNec) {
+      toast(`Embalagem insuficiente: ${emb?.nome || embId} (precisa ${qtdNec}, tem ${emb?.saldo || 0})`, 'erro');
+      return false;
+    }
+  }
+
   // Validar saldo de PA
   const faltam = [];
   for (const [produtoId, qtdNec] of Object.entries(necessario)) {
@@ -476,14 +726,21 @@ function confirmarPedido(pedidoId) {
     p.statusComercial = 'CONFIRMADO';
     if (tipo === 'PRONTA_ENTREGA') p.statusProdutivo = 'PRONTO';
   }
+  // Baixar saldo de embalagem (itens modo EMBALAGEM)
+  for (const [embId, qtdNec] of Object.entries(necessarioEmb)) {
+    const emb = state.insumos.find(i => i.id === embId);
+    if (emb) emb.saldo = Math.max(0, emb.saldo - qtdNec);
+  }
   // Gerar conta a receber
   const cli = state.clientes.find(c => c.id === p.clienteId);
-  const venc = new Date();
-  venc.setDate(venc.getDate() + (cli?.prazoDias || 0));
+  // Prazo: usa do pedido se definido, senão usa do cliente
+  const prazoDias = (typeof p.prazoDias === 'number') ? p.prazoDias : (cli?.prazoDias || 0);
+  const baseData = todayISO(); // data atual em fuso local
+  const vencimento = addDaysISO(baseData, prazoDias);
   state.contasReceber.unshift({
     id: 'cr'+uid(), pedidoId: p.id,
-    descricao: `Pedido #${p.numero} · ${cli?.nome || 'cliente removido'}`,
-    valor: p.total, vencimento: venc.toISOString().slice(0,10), status: 'ABERTA'
+    descricao: `Pedido #${p.numero} · ${cli.nome}`,
+    valor: p.total, vencimento, status: 'ABERTA'
   });
   logAuditoria('06_pedido', 'CONFIRMADO', p.id, `Pedido #${p.numero} (${tipo === 'ENCOMENDA' ? 'encomenda' : 'pronta entrega'}) confirmado · ${fmtBRL(p.total)}`);
   persistState();
@@ -542,7 +799,7 @@ function render() {
       </main>
     </div>
   `;
-  lucide.createIcons();
+  if (typeof lucide!=='undefined') lucide.createIcons();
 }
 
 function renderSidebar(activeRoute) {
@@ -658,15 +915,15 @@ function renderDashboard() {
           <div class="space-y-2">
             ${entregasHoje.map(p => {
               const cli = state.clientes.find(c => c.id === p.clienteId);
-              const statusCor = {'AGUARDANDO':'bg-stone-100', 'EM_PRODUCAO':'bg-brand-amber-50 text-brand-amber-900', 'PRONTO':'bg-brand-teal-50 text-brand-teal-900', 'EXPEDIDO':'bg-brand-purple-50 text-brand-purple-900', 'ENTREGUE':'bg-brand-green-50 text-brand-green-900'}[p.statusProdutivo] || 'bg-stone-100';
+              const statusCor = {'AGUARDANDO':'bg-stone-100', 'EM_PRODUCAO':'bg-brand-amber-50 text-brand-amber-900', 'PRONTO':'bg-brand-teal-50 text-brand-teal-900', 'EXPEDIDO':'bg-brand-purple-50 text-brand-purple-900', 'ENTREGUE':'bg-brand-green-50 text-brand-green-900'}[p.statusProdutivo];
               return `
                 <div class="flex items-center justify-between py-2 border-b border-stone-100 last:border-0">
                   <div>
-                    <p class="text-sm font-medium">#${p.numero} · ${cli?.nome || '⚠ cliente removido'}</p>
-                    <p class="text-xs text-stone-500">${p.itens.map(i => { const pr = state.produtos.find(x=>x.id===i.produtoId); return (pr?.sku || '⚠') + '×' + i.qtd; }).join(' · ')}</p>
+                    <p class="text-sm font-medium">#${p.numero} · ${cli.nome}</p>
+                    <p class="text-xs text-stone-500">${p.itens.map(i => state.produtos.find(pr=>pr.id===i.produtoId).sku + '×' + i.qtd).join(' · ')}</p>
                   </div>
                   <div class="text-right">
-                    <span class="badge ${statusCor}">${(p.statusProdutivo||'').toLowerCase().replace('_',' ')}</span>
+                    <span class="badge ${statusCor}">${p.statusProdutivo.toLowerCase().replace('_',' ')}</span>
                     <p class="text-sm num mt-1">${fmtBRL(p.total)}</p>
                   </div>
                 </div>
@@ -686,7 +943,7 @@ function renderDashboard() {
             return `
               <div>
                 <div class="flex items-center justify-between mb-1">
-                  <p class="text-sm font-medium">OP-${o.numero} · ${prod?.nome || '⚠ produto removido'} (${o.tamanhoLote}un)</p>
+                  <p class="text-sm font-medium">OP-${o.numero} · ${prod.nome} (${o.tamanhoLote}un)</p>
                   <span class="text-xs text-stone-500">${fasesConcluidas}/${o.fases.length} fases</span>
                 </div>
                 <div class="progress">
@@ -724,7 +981,7 @@ function renderDashboard() {
                   return `
                     <tr>
                       <td class="num text-stone-500">${idx+1}</td>
-                      <td><strong>${prod?.nome || '⚠ produto removido'}</strong> <span class="text-xs text-stone-500">${prod?.sku || '—'}</span></td>
+                      <td><strong>${prod.nome}</strong> <span class="text-xs text-stone-500">${prod.sku}</span></td>
                       <td class="text-right num">${fmtBRL(val)}</td>
                       <td class="text-right num">${pct.toFixed(1)}%</td>
                       <td class="text-right">
@@ -1408,12 +1665,12 @@ function abrirModalNovaFicha(produtoIdSugerido) {
   }
   const produtoInicial = produtoIdSugerido || semFicha[0].id;
   abrirModal(renderModalFicha(null, produtoInicial), 'lg');
-  lucide.createIcons();
+  if (typeof lucide!=='undefined') lucide.createIcons();
 }
 
 function abrirModalEditarFicha(receitaId) {
   abrirModal(renderModalFicha(receitaId, null), 'lg');
-  lucide.createIcons();
+  if (typeof lucide!=='undefined') lucide.createIcons();
 }
 
 function renderModalFicha(receitaId, produtoIdSugerido) {
@@ -1494,7 +1751,7 @@ function addItemFicha() {
   const div = document.createElement('div');
   div.innerHTML = renderItemFichaRow(_itemFichaIdx, null);
   document.getElementById('ficha-itens').appendChild(div.firstElementChild);
-  lucide.createIcons();
+  if (typeof lucide!=='undefined') lucide.createIcons();
 }
 
 function handleSalvarFicha(ev, receitaId) {
@@ -1549,12 +1806,43 @@ function handleSalvarFicha(ev, receitaId) {
 // MODULE 03 — MARKUP / PRECIFICAÇÃO
 // ============================================================================
 function renderMarkup() {
-  const produtoSelecionado = window._mkProdutoId || state.produtos[0].id;
-  const p = state.produtos.find(x => x.id === produtoSelecionado);
-  const r = state.receitas.find(rec => rec.produtoId === p.id && rec.ativa);
-  const custo = r ? calcularCustoReceita(r.id) : null;
   const m = state.markup;
   const modoValor = m.modo === 'VALOR_MENSAL';
+
+  // Bloco fixo da embalagem (independe de ter produto cadastrado)
+  const blocoEmbalagem = `
+    <div class="card mb-4">
+      <div class="flex items-start justify-between gap-4">
+        <div class="flex-1">
+          <h3 class="font-display text-lg">Markup das embalagens vendidas</h3>
+          <p class="text-xs text-stone-500">Acréscimo % aplicado sobre o CMP da embalagem quando vendida ao cliente (cenário "+ Embalagem do estoque" no novo pedido). Não afeta o markup do produto.</p>
+        </div>
+        <div class="text-center" style="min-width:160px;">
+          <p class="num text-2xl font-display">${m.markupEmbalagem}%</p>
+          <input type="range" min="0" max="100" step="1" value="${m.markupEmbalagem}"
+            oninput="state.markup.markupEmbalagem=parseInt(this.value); persistState(); render()"
+            class="w-full mt-1" style="accent-color:#1D9E75;">
+          <p class="text-[10px] text-stone-500 mt-1">CMP × ${(1 + m.markupEmbalagem/100).toFixed(2)}</p>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Se não há produtos, mostra só o bloco da embalagem
+  if (state.produtos.length === 0) {
+    return `
+      ${pageHeader('03', 'PRECIFICAÇÃO', 'Composição do preço sugerido')}
+      ${blocoEmbalagem}
+      <div class="card text-center text-stone-500 py-8">
+        <p class="text-sm">Cadastre produtos no módulo 2 para configurar markup e simular preços.</p>
+      </div>
+    `;
+  }
+
+  const produtoSelecionado = window._mkProdutoId || state.produtos[0].id;
+  const p = state.produtos.find(x => x.id === produtoSelecionado) || state.produtos[0];
+  const r = state.receitas.find(rec => rec.produtoId === p.id && rec.ativa);
+  const custo = r ? calcularCustoReceita(r.id) : null;
 
   const calc = custo ? (modoValor
     ? calcularComposicaoValor(custo.custoTotal, m)
@@ -1562,6 +1850,7 @@ function renderMarkup() {
 
   return `
     ${pageHeader('03', 'PRECIFICAÇÃO', 'Composição do preço sugerido')}
+    ${blocoEmbalagem}
 
     <div class="card mb-4 flex items-center justify-between gap-4">
       <div class="flex-1">
@@ -1783,30 +2072,9 @@ function renderSliderCard(label, key, valor, cor, hint) {
 // MODULE 06 — PEDIDOS
 // ============================================================================
 function renderPedidos() {
-  // Detectar pedidos com referências quebradas (cliente ou produto removido)
-  const orfaos = state.pedidos.filter(p => {
-    const semCliente = !state.clientes.find(c => c.id === p.clienteId);
-    const semProduto = p.itens.some(it => !state.produtos.find(x => x.id === it.produtoId));
-    return semCliente || semProduto;
-  });
-  const avisoOrfaos = orfaos.length > 0 ? `
-    <div class="card mb-4 border-l-4" style="border-left-color:#E24B4A; background:#FDECEC;">
-      <div class="flex items-start gap-2">
-        <i data-lucide="alert-triangle" class="w-4 h-4 text-brand-coral-900 mt-0.5 shrink-0"></i>
-        <div class="text-xs text-brand-coral-900">
-          <p class="font-medium mb-1">${orfaos.length} pedido(s) com referência(s) quebrada(s) — cliente ou produto foi removido após o cadastro do pedido.</p>
-          <p>Pedidos afetados: ${orfaos.map(p => `<strong>#${p.numero}</strong>`).join(', ')}.
-          Eles continuam listados abaixo com a marcação <span class="font-mono">⚠ removido</span> — abra cada um para revisar e decida cancelar ou recriar.</p>
-        </div>
-      </div>
-    </div>
-  ` : '';
-
   return `
     ${pageHeader('06', 'PEDIDOS', 'Vendas & status',
       `<button class="btn btn-primary" onclick="abrirModalNovoPedido()"><i data-lucide="plus" class="w-3.5 h-3.5"></i> Novo pedido</button>`)}
-
-    ${avisoOrfaos}
 
     <div class="card p-0 overflow-hidden">
       <table>
@@ -1818,32 +2086,33 @@ function renderPedidos() {
         <tbody>
           ${[...state.pedidos].sort((a,b) => b.numero - a.numero).map(p => {
             const cli = state.clientes.find(c => c.id === p.clienteId);
-            const cliNome = cli ? cli.nome : '⚠ cliente removido';
-            const cliTipo = cli ? cli.tipo : '—';
             const itensTxt = p.itens.map(i => {
               const prod = state.produtos.find(x => x.id === i.produtoId);
               const g = i.gramatura || prod?.pesoLiq || '?';
-              const ref = prod ? prod.sku : '⚠ produto removido';
-              return `${i.qtd}×${g}g ${ref}`;
+              return `${i.qtd}×${g}g ${prod.sku}`;
             }).join(' · ');
-            const corComercial = {'RASCUNHO':'bg-stone-100','CONFIRMADO':'bg-brand-purple-50 text-brand-purple-900','FATURADO':'bg-brand-amber-50 text-brand-amber-900','PAGO':'bg-brand-teal-50 text-brand-teal-900','CANCELADO':'bg-brand-coral-50 text-brand-coral-900'}[p.statusComercial] || 'bg-stone-100';
-            const corProd = {'AGUARDANDO':'bg-stone-100','EM_PRODUCAO':'bg-brand-amber-50 text-brand-amber-900','PRONTO':'bg-brand-teal-50 text-brand-teal-900','EXPEDIDO':'bg-brand-purple-50 text-brand-purple-900','ENTREGUE':'bg-brand-green-50 text-brand-green-900','ATRASADO':'bg-brand-coral-50 text-brand-coral-900'}[p.statusProdutivo] || 'bg-stone-100';
+            const corComercial = {'RASCUNHO':'bg-stone-100','CONFIRMADO':'bg-brand-purple-50 text-brand-purple-900','FATURADO':'bg-brand-amber-50 text-brand-amber-900','PAGO':'bg-brand-teal-50 text-brand-teal-900','CANCELADO':'bg-brand-coral-50 text-brand-coral-900'}[p.statusComercial];
+            const corProd = {'AGUARDANDO':'bg-stone-100','EM_PRODUCAO':'bg-brand-amber-50 text-brand-amber-900','PRONTO':'bg-brand-teal-50 text-brand-teal-900','EXPEDIDO':'bg-brand-purple-50 text-brand-purple-900','ENTREGUE':'bg-brand-green-50 text-brand-green-900','ATRASADO':'bg-brand-coral-50 text-brand-coral-900'}[p.statusProdutivo];
             const tipo = p.tipo || 'ENCOMENDA';
             const corTipo = tipo === 'ENCOMENDA' ? 'bg-brand-purple-50 text-brand-purple-900' : 'bg-brand-teal-50 text-brand-teal-900';
             const opsVinculadas = state.ordens.filter(o => o.pedidoOrigemId === p.id);
             return `
               <tr>
                 <td class="num font-mono text-xs">#${p.numero}${opsVinculadas.length > 0 ? `<span class="block text-[10px] text-stone-500">↳ ${opsVinculadas.map(o => 'OP-'+o.numero).join(', ')}</span>` : ''}</td>
-                <td><strong>${cliNome}</strong> <span class="text-xs text-stone-500 block">${cliTipo} · ${p.canal||''}</span></td>
+                <td><strong>${cli.nome}</strong> <span class="text-xs text-stone-500 block">${cli.tipo} · ${p.canal||''}</span></td>
                 <td><span class="badge ${corTipo} text-[10px]">${tipo === 'ENCOMENDA' ? 'encomenda' : 'pronta entrega'}</span></td>
                 <td class="text-xs">${itensTxt}</td>
-                <td><span class="badge ${corComercial}">${(p.statusComercial||'').toLowerCase()}</span></td>
-                <td><span class="badge ${corProd}">${(p.statusProdutivo||'').toLowerCase().replace('_',' ')}</span></td>
+                <td><span class="badge ${corComercial}">${p.statusComercial.toLowerCase()}</span></td>
+                <td><span class="badge ${corProd}">${p.statusProdutivo.toLowerCase().replace('_',' ')}</span></td>
                 <td class="text-xs">${fmtDate(p.dataEntrega)}</td>
                 <td class="text-right num font-medium">${fmtBRL(p.total)}</td>
                 <td class="text-right">
-                  ${p.statusComercial === 'RASCUNHO' ? `<button class="btn text-xs btn-primary" onclick="handleConfirmarPedido('${p.id}')">Confirmar</button>` : ''}
-                  <button class="btn text-xs" onclick="abrirDetalhePedido('${p.id}')"><i data-lucide="eye" class="w-3 h-3"></i></button>
+                  <div class="flex gap-1 justify-end">
+                    ${p.statusComercial === 'RASCUNHO' ? `<button class="btn text-xs btn-primary" onclick="handleConfirmarPedido('${p.id}')" title="Confirmar pedido">Confirmar</button>` : ''}
+                    <button class="btn text-xs" onclick="abrirDetalhePedido('${p.id}')" title="Ver detalhes"><i data-lucide="eye" class="w-3 h-3"></i></button>
+                    ${['RASCUNHO','CONFIRMADO'].includes(p.statusComercial) ? `<button class="btn text-xs" onclick="editarPedido('${p.id}')" title="Editar"><i data-lucide="edit-2" class="w-3 h-3"></i></button>` : ''}
+                    ${p.statusComercial !== 'CANCELADO' ? `<button class="btn btn-danger text-xs" onclick="cancelarPedido('${p.id}')" title="Cancelar e estornar"><i data-lucide="x" class="w-3 h-3"></i></button>` : ''}
+                  </div>
                 </td>
               </tr>
             `;
@@ -1866,10 +2135,6 @@ function abrirDetalhePedido(pedidoId) {
   const cli = state.clientes.find(c => c.id === p.clienteId);
   const tipo = p.tipo || 'ENCOMENDA';
   const opsVinculadas = state.ordens.filter(o => o.pedidoOrigemId === p.id);
-  const cliNome = cli ? cli.nome : '⚠ cliente removido';
-  const cliTipo = cli ? cli.tipo : '—';
-  const cliCidade = cli ? cli.cidade : '—';
-  const temOrfaos = !cli || p.itens.some(it => !state.produtos.find(x => x.id === it.produtoId));
   abrirModal(`
     <div class="flex items-start justify-between mb-1">
       <h2 class="font-display text-xl">Pedido #${p.numero}</h2>
@@ -1877,51 +2142,49 @@ function abrirDetalhePedido(pedidoId) {
         ${tipo === 'ENCOMENDA' ? 'encomenda' : 'pronta entrega'}
       </span>
     </div>
-    <p class="text-sm text-stone-500 mb-4">${cliNome} · ${cliTipo} · ${cliCidade}</p>
-
-    ${temOrfaos ? `
-      <div class="card mb-3 border-l-4 py-2" style="border-left-color:#E24B4A; background:#FDECEC;">
-        <p class="text-xs text-brand-coral-900">
-          <i data-lucide="alert-triangle" class="w-3 h-3 inline"></i>
-          Este pedido tem referência(s) quebrada(s). Revise abaixo e considere cancelar ou recriar.
-        </p>
-      </div>
-    ` : ''}
+    <p class="text-sm text-stone-500 mb-4">${cli.nome} · ${cli.tipo} · ${cli.cidade}</p>
 
     <table>
-      <thead><tr><th>Produto</th><th class="text-right">Gramatura</th><th class="text-right">Pacotes</th><th class="text-right">Preço un.</th><th class="text-right">Subtotal</th><th class="text-right">Equiv. embal.</th></tr></thead>
+      <thead><tr><th>Produto</th><th>Embalagem</th><th class="text-right">Gramatura</th><th class="text-right">Pacotes</th><th class="text-right">Preço un.</th><th class="text-right">Subtotal</th><th class="text-right">Equiv. embal.</th></tr></thead>
       <tbody>
         ${p.itens.map(i => {
-          const prod = state.produtos.find(x => x.id === i.produtoId);
-          const gramatura = i.gramatura || prod?.pesoLiq || 500;
-          const unEq = (i.qtd * gramatura) / (prod?.pesoLiq || 500);
-          const prodNome = prod ? prod.nome : '⚠ produto removido';
-          const prodSku = prod ? prod.sku : '—';
+          const prod = i.produtoId ? state.produtos.find(x => x.id === i.produtoId) : null;
+          const gramatura = i.gramatura || prod?.pesoLiq || 0;
+          const unEq = prod ? (i.qtd * gramatura) / (prod.pesoLiq || 500) : 0;
+          const emb = i.embalagemId ? state.insumos.find(x => x.id === i.embalagemId) : null;
+          const embLabel = emb
+            ? `<span class="text-xs">${emb.nome}</span>`
+            : `<span class="text-xs text-stone-400">— fracionado —</span>`;
+          // Nome a exibir: se tem produto, é o produto. Se não, é "Embalagem vazia (nome da embalagem)".
+          const nomeExibir = prod
+            ? `<strong>${prod.nome}</strong> <span class="text-xs text-stone-500 block">${prod.sku}</span>`
+            : `<em class="text-stone-500">${emb?.nome || 'Embalagem'}</em> <span class="text-xs text-stone-400 block">só embalagem</span>`;
           return `
             <tr>
-              <td><strong>${prodNome}</strong> <span class="text-xs text-stone-500 block">${prodSku}</span></td>
-              <td class="text-right num">${gramatura}g</td>
+              <td>${nomeExibir}</td>
+              <td>${embLabel}</td>
+              <td class="text-right num">${gramatura > 0 ? gramatura + 'g' : '—'}</td>
               <td class="text-right num">${i.qtd}</td>
               <td class="text-right num">${fmtBRL(i.preco)}</td>
               <td class="text-right num font-medium">${fmtBRL(i.qtd * i.preco)}</td>
-              <td class="text-right num text-xs text-stone-500">${fmtNum(unEq, 2)} un</td>
+              <td class="text-right num text-xs text-stone-500">${prod ? fmtNum(unEq, 2) + ' un' : '—'}</td>
             </tr>
           `;
         }).join('')}
-        <tr><td colspan="4" class="text-right text-xs text-stone-600">Subtotal dos itens</td>
+        <tr><td colspan="5" class="text-right text-xs text-stone-600">Subtotal dos itens</td>
           <td class="text-right num text-xs">${fmtBRL(p.subtotal || p.total)}</td>
           <td></td></tr>
         ${Math.abs(p.bonificacao || 0) > 0.005 ? `
-        <tr><td colspan="4" class="text-right text-xs ${p.bonificacao > 0 ? 'text-brand-amber-900' : 'text-brand-purple-900'}">
+        <tr><td colspan="5" class="text-right text-xs ${p.bonificacao > 0 ? 'text-brand-amber-900' : 'text-brand-purple-900'}">
           ${p.bonificacao > 0 ? '(+) Bonificação recebida (arredondamento)' : '(−) Bonificação concedida (arredondamento)'}
         </td>
           <td class="text-right num text-xs ${p.bonificacao > 0 ? 'text-brand-amber-900' : 'text-brand-purple-900'}">${p.bonificacao > 0 ? '+' : '−'}${fmtBRL(Math.abs(p.bonificacao))}</td>
           <td></td></tr>
         ` : ''}
-        <tr class="bg-brand-purple-50"><td colspan="4" class="text-right font-display">Total cobrado</td>
+        <tr class="bg-brand-purple-50"><td colspan="5" class="text-right font-display">Total cobrado</td>
           <td class="text-right num font-display font-medium">${fmtBRL(p.total)}</td>
           <td class="text-right num text-xs">${fmtBRL(p.custoSnapshot)} custo</td></tr>
-        <tr><td colspan="5" class="text-right text-xs text-stone-600">Margem do pedido</td>
+        <tr><td colspan="6" class="text-right text-xs text-stone-600">Margem do pedido</td>
           <td class="text-right num text-xs font-medium text-brand-teal-900">${((1 - p.custoSnapshot/p.total)*100).toFixed(1)}%</td></tr>
       </tbody>
     </table>
@@ -1944,15 +2207,33 @@ function abrirDetalhePedido(pedidoId) {
     <div class="mt-3 p-3 bg-stone-50 rounded text-xs space-y-1">
       <p><span class="text-stone-500">Tipo:</span> ${tipo === 'ENCOMENDA' ? 'Encomenda (produção sob demanda)' : 'Pronta entrega (do estoque)'}</p>
       <p><span class="text-stone-500">Canal:</span> ${p.canal}</p>
+      <p><span class="text-stone-500">Forma de pagamento:</span> ${p.formaPagto || '<span class="text-stone-400">— não definida —</span>'}</p>
+      <p><span class="text-stone-500">Prazo:</span> ${p.prazoDias ? `${p.prazoDias} dias` : 'à vista'}</p>
       <p><span class="text-stone-500">Criado em:</span> ${fmtDateTime(p.criadoEm)}</p>
       <p><span class="text-stone-500">Entrega prometida:</span> ${fmtDate(p.dataEntrega)}</p>
       <p><span class="text-stone-500">Custo snapshot:</span> ${fmtBRL(p.custoSnapshot)} (congelado no momento da confirmação)</p>
+      ${p.statusComercial === 'CANCELADO' ? `<p class="mt-2 text-brand-coral-900"><strong>Cancelado em:</strong> ${p.canceladoEm ? fmtDateTime(p.canceladoEm) : '—'}<br><strong>Motivo:</strong> ${p.motivoCancelamento || '—'}</p>` : ''}
     </div>
-    <div class="text-right mt-4"><button class="btn" onclick="fecharModal()">Fechar</button></div>
+    <div class="flex justify-between gap-2 mt-4">
+      <div class="flex gap-2">
+        ${['RASCUNHO','CONFIRMADO'].includes(p.statusComercial) ? `<button class="btn" onclick="fecharModal(); editarPedido('${p.id}')"><i data-lucide="edit-2" class="w-3 h-3"></i> Editar</button>` : ''}
+        ${p.statusComercial !== 'CANCELADO' ? `<button class="btn btn-danger" onclick="cancelarPedido('${p.id}')"><i data-lucide="x" class="w-3 h-3"></i> Cancelar pedido</button>` : ''}
+      </div>
+      <button class="btn" onclick="fecharModal()">Fechar</button>
+    </div>
   `, 'lg');
+  if (typeof lucide!=='undefined') lucide.createIcons();
 }
 
 function abrirModalNovoPedido() {
+  if (state.clientes.length === 0) {
+    toast('Cadastre ao menos um cliente no módulo 7 antes de criar pedidos', 'erro');
+    return;
+  }
+  if (state.produtos.length === 0) {
+    toast('Cadastre ao menos um produto no módulo 2 antes de criar pedidos', 'erro');
+    return;
+  }
   // Reset do contador de itens UI
   window._pedItemIdx = 0;
   window._pedItens = [];
@@ -1982,7 +2263,7 @@ function abrirModalNovoPedido() {
 
       <div class="grid grid-cols-2 gap-3">
         <div><label class="text-xs text-stone-600">Cliente</label>
-          <select name="clienteId" required class="input">
+          <select name="clienteId" required class="input" onchange="aplicarPagamentoDoCliente(this.value)">
             ${state.clientes.map(c => `<option value="${c.id}">${c.nome} (${c.tipo})</option>`).join('')}
           </select></div>
         <div><label class="text-xs text-stone-600">Canal</label>
@@ -1992,8 +2273,23 @@ function abrirModalNovoPedido() {
             <option value="ecommerce">E-commerce</option>
           </select></div>
       </div>
-      <div><label class="text-xs text-stone-600">Data de entrega prometida</label>
-        <input name="dataEntrega" type="date" required class="input" value="${todayISO()}"></div>
+      <div class="grid grid-cols-3 gap-3">
+        <div><label class="text-xs text-stone-600">Data de entrega</label>
+          <input name="dataEntrega" type="date" required class="input" value="${todayISO()}"></div>
+        <div><label class="text-xs text-stone-600">Forma de pagamento</label>
+          <select name="formaPagto" id="form-pgto-pedido" class="input">
+            <option value="">— usar do cliente —</option>
+            <option value="dinheiro">Dinheiro</option>
+            <option value="pix">PIX</option>
+            <option value="debito">Débito</option>
+            <option value="credito">Crédito</option>
+            <option value="boleto">Boleto</option>
+            <option value="prazo">Prazo (faturado)</option>
+          </select></div>
+        <div><label class="text-xs text-stone-600">Prazo (dias)</label>
+          <input name="prazoDias" type="number" min="0" step="1" id="prazo-pedido" class="input" placeholder="0 = à vista"></div>
+      </div>
+      <p class="text-[10px] text-stone-500 mt-1">💡 Se deixar em branco, usa a forma e prazo padrão do cliente selecionado.</p>
 
       <div>
         <div class="flex items-center justify-between mb-1">
@@ -2052,38 +2348,57 @@ function abrirModalNovoPedido() {
       </div>
     </form>
   `, 'lg');
-  lucide.createIcons();
+  if (typeof lucide!=='undefined') lucide.createIcons();
   // Tipo padrão (ENCOMENDA conforme regra: encomenda = 70% do negócio)
   // NOTA: o usuário pediu "sempre perguntar, sem default" — por isso não pré-marcamos
 }
 
-// ----- Adicionar item: EMBALAGEM DO ESTOQUE (modo rápido) -------------------
+// ----- Adicionar item: EMBALAGEM DO ESTOQUE (só a embalagem, independente) -----
 function addItemPedidoEmbalagem() {
-  const produtosComEstoque = state.produtos.filter(p => p.saldoPa > 0);
-  if (produtosComEstoque.length === 0) {
-    toast('Nenhum produto com saldo em estoque · use "+ Item fracionado" ou crie uma OP primeiro', 'erro');
+  const embalagensComSaldo = state.insumos.filter(i =>
+    ['EMBALAGEM_PRIMARIA','EMBALAGEM_SECUNDARIA','EMBALAGEM_PROPORCIONAL'].includes(i.tipo) && i.saldo > 0
+  );
+  if (embalagensComSaldo.length === 0) {
+    toast('Nenhuma embalagem com saldo em estoque · cadastre no módulo de insumos primeiro', 'erro');
     return;
   }
   const idx = ++window._pedItemIdx;
-  const prodInicial = produtosComEstoque[0];
-  const precoSugerido = precoSugeridoEmbalagem(prodInicial.id);
+  const embInicial = embalagensComSaldo[0];
+  const precoInicial = precoSugeridoEmbalagem(embInicial.id);
   const row = document.createElement('div');
   row.className = 'pedido-item';
   row.dataset.idx = idx;
   row.dataset.modo = 'EMBALAGEM';
-  row.innerHTML = renderItemEmbalagem(idx, prodInicial.id, 1, precoSugerido);
+  row.innerHTML = renderItemEmbalagem(idx, embInicial.id, 1, precoInicial);
   document.getElementById('pedido-itens').appendChild(row);
   document.getElementById('pedido-itens-vazio').style.display = 'none';
-  lucide.createIcons();
+  if (typeof lucide!=='undefined') lucide.createIcons();
   atualizarResumoPedido();
 }
 
-function renderItemEmbalagem(idx, produtoId, qtd, preco) {
-  const prod = state.produtos.find(p => p.id === produtoId);
-  const r = state.receitas.find(rec => rec.produtoId === produtoId && rec.ativa);
-  const custo = r ? calcularCustoReceita(r.id) : null;
-  const custoEmb = custo ? custo.custoTotal : 0;
-  const margemPct = preco > 0 ? ((preco - custoEmb) / preco) * 100 : 0;
+// Preço sugerido = CMP da embalagem × (1 + markupEmbalagem/100)
+function precoSugeridoEmbalagem(embalagemId) {
+  const emb = state.insumos.find(i => i.id === embalagemId);
+  if (!emb) return 0;
+  const markupEmb = 1 + (Number(state.markup.markupEmbalagem) || 30) / 100;
+  return Math.round((Number(emb.cmp) || 0) * markupEmb * 10) / 10; // arredonda a R$ 0,10
+}
+
+function renderItemEmbalagem(idx, embalagemId, qtd, preco) {
+  const embalagensComSaldo = state.insumos.filter(i =>
+    ['EMBALAGEM_PRIMARIA','EMBALAGEM_SECUNDARIA','EMBALAGEM_PROPORCIONAL'].includes(i.tipo) && i.saldo > 0
+  );
+  const emb = state.insumos.find(i => i.id === embalagemId);
+  const tipoLabel = {
+    'EMBALAGEM_PRIMARIA':'primária',
+    'EMBALAGEM_SECUNDARIA':'secundária',
+    'EMBALAGEM_PROPORCIONAL':'proporcional'
+  }[emb?.tipo] || '';
+  const markupEmb = Number(state.markup.markupEmbalagem) || 30;
+  const cmpEmb = Number(emb?.cmp) || 0;
+  const valorComMarkup = cmpEmb * (1 + markupEmb/100);
+  const margemPct = preco > 0 ? ((preco - cmpEmb) / preco) * 100 : 0;
+
   return `
     <div class="border rounded-md p-3" style="border-color:#1D9E75; background:#E1F5EE;">
       <div class="flex items-center justify-between mb-2">
@@ -2094,70 +2409,70 @@ function renderItemEmbalagem(idx, produtoId, qtd, preco) {
           <i data-lucide="x" class="w-3 h-3"></i>
         </button>
       </div>
-      <div class="grid gap-2" style="grid-template-columns: 2fr 90px 90px 130px 1fr;">
+
+      <div class="grid gap-2 mb-2" style="grid-template-columns: 1fr 90px;">
         <div>
-          <p class="text-[10px]" style="color:#04342C;">Produto (em estoque)</p>
-          <select name="produtoId_${idx}" class="input text-xs"
-            onchange="recalcularItemEmbalagem(${idx})">
-            ${state.produtos.filter(p => p.saldoPa > 0).map(p => `
-              <option value="${p.id}" ${p.id===produtoId?'selected':''}>${p.nome} — ${fmtNum(p.saldoPa,2)} un disponíveis</option>
+          <p class="text-[10px]" style="color:#04342C;">Embalagem (insumo em estoque)</p>
+          <select name="embalagemId_${idx}" class="input text-xs"
+            onchange="recalcularPrecoEmbalagem(${idx})">
+            ${embalagensComSaldo.map(e => `
+              <option value="${e.id}" ${e.id===embalagemId?'selected':''}>${e.nome} — ${fmtNum(e.saldo,0)} ${e.unidade} disp. (${ {EMBALAGEM_PRIMARIA:'prim.',EMBALAGEM_SECUNDARIA:'sec.',EMBALAGEM_PROPORCIONAL:'prop.'}[e.tipo] || ''})</option>
             `).join('')}
           </select>
-          <input type="hidden" name="gramatura_${idx}" value="${prod?.pesoLiq || 500}">
-          <input type="hidden" name="modo_${idx}" value="EMBALAGEM">
         </div>
         <div>
-          <p class="text-[10px]" style="color:#04342C;">Saldo PA</p>
-          <p class="num font-medium text-sm" id="saldo-pa-${idx}" style="color:#04342C; padding-top:6px;">${fmtNum(prod?.saldoPa || 0, 2)} un</p>
+          <p class="text-[10px]" style="color:#04342C;">Saldo emb.</p>
+          <p class="num font-medium text-sm" style="color:#04342C; padding-top:6px;">${fmtNum(emb?.saldo || 0, 0)} ${emb?.unidade || 'un'}</p>
         </div>
+      </div>
+
+      <input type="hidden" name="produtoId_${idx}" value="">
+      <input type="hidden" name="gramatura_${idx}" value="0">
+      <input type="hidden" name="modo_${idx}" value="EMBALAGEM">
+
+      <div class="grid gap-2" style="grid-template-columns: 90px 130px 1fr;">
         <div>
           <p class="text-[10px]" style="color:#04342C;">Pacotes</p>
           <input name="qtd_${idx}" type="number" min="1" step="1" value="${qtd}" class="input text-xs"
-            oninput="atualizarResumoPedido()">
+            oninput="atualizarResumoPedido(); atualizarSubtotalItem(${idx});">
         </div>
         <div>
-          <p class="text-[10px]" style="color:#04342C;">Preço unit. (${prod?.pesoLiq || 500}g)</p>
-          <input name="preco_${idx}" type="number" min="0" step="0.01" value="${preco.toFixed(2)}" class="input text-xs"
-            oninput="atualizarResumoPedido()">
+          <p class="text-[10px]" style="color:#04342C;">Preço unit.</p>
+          <input name="preco_${idx}" type="number" min="0" step="0.01" value="${preco > 0 ? preco.toFixed(2) : ''}" class="input text-xs"
+            oninput="atualizarResumoPedido(); atualizarSubtotalItem(${idx});">
         </div>
         <div class="text-right">
           <p class="text-[10px]" style="color:#04342C;">Subtotal</p>
           <p class="num font-medium text-sm" id="subtotal-${idx}" style="color:#04342C; padding-top:6px;">${fmtBRL(qtd * preco)}</p>
         </div>
       </div>
-      <p class="text-[11px] mt-2" style="color:#0F6E56;">
+
+      <p class="text-[11px] mt-2" id="composicao-emb-${idx}" style="color:#0F6E56;">
         <i data-lucide="info" class="w-3 h-3 inline"></i>
-        Embalagem completa · baixa direta do estoque · custo ${fmtBRL(custoEmb)} · margem ${margemPct.toFixed(1)}%
+        ${tipoLabel} · CMP ${fmtBRL(cmpEmb)} × ${(1+markupEmb/100).toFixed(2)} = ${fmtBRL(valorComMarkup)} sugerido · margem ${margemPct.toFixed(1)}%
       </p>
     </div>
   `;
 }
 
-function recalcularItemEmbalagem(idx) {
+function recalcularPrecoEmbalagem(idx) {
   const row = document.querySelector(`.pedido-item[data-idx="${idx}"]`);
   if (!row) return;
-  const selProd = row.querySelector(`[name="produtoId_${idx}"]`);
-  const prod = state.produtos.find(p => p.id === selProd.value);
-  if (!prod) return;
-  const novoPreco = precoSugeridoEmbalagem(prod.id);
+  const embId = row.querySelector(`[name="embalagemId_${idx}"]`).value;
   const qtd = parseFloat(row.querySelector(`[name="qtd_${idx}"]`).value) || 1;
-  // Regerar a row inteira preservando qtd
-  row.innerHTML = renderItemEmbalagem(idx, prod.id, qtd, novoPreco);
-  lucide.createIcons();
+  const precoSugerido = precoSugeridoEmbalagem(embId);
+  row.innerHTML = renderItemEmbalagem(idx, embId, qtd, precoSugerido);
+  if (typeof lucide!=='undefined') lucide.createIcons();
   atualizarResumoPedido();
 }
 
-function precoSugeridoEmbalagem(produtoId) {
-  const r = state.receitas.find(rec => rec.produtoId === produtoId && rec.ativa);
-  if (!r) return 0;
-  const custo = calcularCustoReceita(r.id);
-  if (!custo) return 0;
-  const preco = calcularPrecoSugerido(custo.custoTotal);
-  return Math.round(preco * 10) / 10;
-}
 
 // ----- Adicionar item: FRACIONADO (granel com chips) ------------------------
 function addItemPedidoFracionado() {
+  if (state.produtos.length === 0) {
+    toast('Cadastre ao menos um produto no módulo 2 antes de criar pedidos', 'erro');
+    return;
+  }
   const idx = ++window._pedItemIdx;
   const prodInicial = state.produtos[0];
   if (!prodInicial) return;
@@ -2168,7 +2483,7 @@ function addItemPedidoFracionado() {
   row.innerHTML = renderItemFracionado(idx, prodInicial.id, null, 1, 0);
   document.getElementById('pedido-itens').appendChild(row);
   document.getElementById('pedido-itens-vazio').style.display = 'none';
-  lucide.createIcons();
+  if (typeof lucide!=='undefined') lucide.createIcons();
   // Pré-selecionar a gramatura da embalagem completa por padrão
   selecionarGramatura(idx, prodInicial.pesoLiq);
 }
@@ -2442,7 +2757,7 @@ function atualizarResumoPedido() {
       banner.style.cssText = cor + 'padding:8px 12px; border-radius:0 6px 6px 0; font-size:12px;';
       banner.innerHTML = `<i data-lucide="gift" class="w-3 h-3 inline"></i> ${texto}`;
       banner.style.display = 'block';
-      lucide.createIcons();
+      if (typeof lucide!=='undefined') lucide.createIcons();
     } else {
       banner.style.display = 'none';
     }
@@ -2490,8 +2805,21 @@ function handleNovoPedido(ev) {
     const qtd = parseInt(row.querySelector(`[name="qtd_${idx}"]`).value);
     const preco = parseFloat(row.querySelector(`[name="preco_${idx}"]`).value);
     const modo = row.querySelector(`[name="modo_${idx}"]`).value;
-    if (produtoId && gramatura > 0 && qtd > 0 && preco > 0) {
-      itens.push({ produtoId, gramatura, qtd, preco, modo });
+    // Embalagem só existe quando modo === 'EMBALAGEM'
+    const embalagemEl = row.querySelector(`[name="embalagemId_${idx}"]`);
+    const embalagemId = embalagemEl ? embalagemEl.value : null;
+    // Validação:
+    //  - Item FRACIONADO precisa ter produto + gramatura
+    //  - Item EMBALAGEM precisa ter embalagemId; produto e gramatura são opcionais
+    const valido = (modo === 'EMBALAGEM')
+      ? (embalagemId && qtd > 0 && preco > 0)
+      : (produtoId && gramatura > 0 && qtd > 0 && preco > 0);
+    if (valido) {
+      itens.push({
+        produtoId: produtoId || null,
+        gramatura: gramatura || 0,
+        qtd, preco, modo, embalagemId
+      });
     }
   });
   if (itens.length === 0) { toast('Adicione pelo menos um item', 'erro'); return; }
@@ -2522,6 +2850,26 @@ function handleNovoPedido(ev) {
     }
   }
 
+  // Verificar saldo de EMBALAGEM (modo embalagem)
+  const necessarioPorEmbalagem = {};
+  itens.forEach(it => {
+    if (it.modo === 'EMBALAGEM' && it.embalagemId) {
+      necessarioPorEmbalagem[it.embalagemId] = (necessarioPorEmbalagem[it.embalagemId] || 0) + it.qtd;
+    }
+  });
+  const faltamEmb = [];
+  for (const [embId, necessario] of Object.entries(necessarioPorEmbalagem)) {
+    const emb = state.insumos.find(i => i.id === embId);
+    if (emb && emb.saldo < necessario) {
+      faltamEmb.push({ embalagem: emb, pedido: necessario, saldo: emb.saldo });
+    }
+  }
+  if (faltamEmb.length > 0) {
+    const lista = faltamEmb.map(f => `· ${f.embalagem.nome}: precisa ${f.pedido} ${f.embalagem.unidade}, tem ${f.saldo}`).join('\n');
+    toast('Estoque de embalagem insuficiente:\n' + lista, 'erro');
+    return;
+  }
+
   if (tipo === 'PRONTA_ENTREGA' && faltam.length > 0) {
     const lista = faltam.map(f => `· ${f.produto.nome}: pedido equiv. ${fmtNum(f.pedido,2)} un, em estoque ${fmtNum(f.saldo,2)} un (faltam ${fmtNum(f.faltam,2)})`).join('\n');
     if (!confirm(`Estoque insuficiente para PRONTA ENTREGA:\n\n${lista}\n\nDeseja converter este pedido para ENCOMENDA e gerar Ordem(ns) de Produção automaticamente?\n\nClique OK para converter em encomenda + gerar OP, ou Cancelar para revisar os itens.`)) {
@@ -2546,7 +2894,7 @@ function handleNovoPedido(ev) {
 
 function criarPedidoComOP(form, fd, itens, tipo, faltam, criarOPs, totalFinal, bonificacao) {
   const subtotal = itens.reduce((s, i) => s + i.qtd * i.preco, 0);
-  // Custo snapshot — proporcional à gramatura
+  // Custo snapshot — proporcional à gramatura + custo de embalagem (se item EMBALAGEM)
   let custoSnapshot = 0;
   for (const i of itens) {
     const prod = state.produtos.find(x => x.id === i.produtoId);
@@ -2556,17 +2904,30 @@ function criarPedidoComOP(form, fd, itens, tipo, faltam, criarOPs, totalFinal, b
       const fatorGramatura = i.gramatura / (prod.pesoLiq || 500);
       custoSnapshot += c.custoTotal * fatorGramatura * i.qtd;
     }
+    // Soma custo da embalagem se for item de modo EMBALAGEM
+    if (i.modo === 'EMBALAGEM' && i.embalagemId) {
+      const emb = state.insumos.find(ins => ins.id === i.embalagemId);
+      if (emb) custoSnapshot += (Number(emb.cmp) || 0) * i.qtd;
+    }
   }
 
   const proxNum = Math.max(...state.pedidos.map(p => p.numero), 0) + 1;
+  // Forma e prazo de pagamento — usa do form, ou fallback do cliente
+  const cli = state.clientes.find(c => c.id === fd.get('clienteId'));
+  const formaPagto = fd.get('formaPagto') || cli?.formaPagto || '';
+  const prazoDiasInput = fd.get('prazoDias');
+  const prazoDias = (prazoDiasInput !== '' && prazoDiasInput != null)
+    ? parseInt(prazoDiasInput)
+    : (cli?.prazoDias || 0);
   const novoPedido = {
     id: 'pe'+uid(), numero: proxNum, tipo,
     clienteId: fd.get('clienteId'), canal: fd.get('canal'),
+    formaPagto, prazoDias,
     statusComercial: 'RASCUNHO', statusProdutivo: 'AGUARDANDO',
     criadoEm: new Date().toISOString(), dataEntrega: fd.get('dataEntrega'),
-    subtotal,                                // soma dos itens sem arredondamento
-    total: totalFinal,                       // valor cobrado (com arredondamento)
-    bonificacao: bonificacao || 0,           // delta = total − subtotal (pode ser ±)
+    subtotal,
+    total: totalFinal,
+    bonificacao: bonificacao || 0,
     custoSnapshot,
     itens
   };
@@ -2608,6 +2969,418 @@ function criarPedidoComOP(form, fd, itens, tipo, faltam, criarOPs, totalFinal, b
   } else {
     toast(`Pedido #${proxNum} (${tipo === 'ENCOMENDA' ? 'encomenda' : 'pronta entrega'}) criado como rascunho`);
   }
+  render();
+}
+
+// ----- Pré-preenche forma/prazo de pagto do cliente ao trocar no select ----
+function aplicarPagamentoDoCliente(clienteId) {
+  const cli = state.clientes.find(c => c.id === clienteId);
+  if (!cli) return;
+  const selForma = document.getElementById('form-pgto-pedido');
+  const inputPrazo = document.getElementById('prazo-pedido');
+  if (selForma && !selForma.value) selForma.value = cli.formaPagto || '';
+  if (inputPrazo && !inputPrazo.value) inputPrazo.value = cli.prazoDias || '';
+}
+
+// ----- Cancelar pedido (com estorno de estoque, embalagem e contas) --------
+async function cancelarPedido(pedidoId) {
+  const p = state.pedidos.find(x => x.id === pedidoId);
+  if (!p) return;
+  if (p.statusComercial === 'CANCELADO') {
+    toast('Pedido já está cancelado', 'erro');
+    return;
+  }
+  const motivo = prompt(`Cancelar pedido #${p.numero}?\n\nIsso vai:\n- Marcar pedido como CANCELADO\n- Estornar saldo de produtos (se já foi baixado)\n- Estornar saldo de embalagens\n- Cancelar conta a receber vinculada\n- Cancelar OPs vinculadas (se não iniciadas)\n\nMotivo do cancelamento:`);
+  if (motivo === null) return; // cancelou o prompt
+  // Estorno de PA + embalagem (só se já foi confirmado)
+  if (p.statusComercial !== 'RASCUNHO') {
+    const necessario = {};
+    const necessarioEmb = {};
+    p.itens.forEach(it => {
+      const prod = state.produtos.find(x => x.id === it.produtoId);
+      if (prod) {
+        const gramatura = it.gramatura || prod.pesoLiq;
+        const unEq = (it.qtd * gramatura) / (prod.pesoLiq || 500);
+        necessario[it.produtoId] = (necessario[it.produtoId] || 0) + unEq;
+      }
+      if (it.modo === 'EMBALAGEM' && it.embalagemId) {
+        necessarioEmb[it.embalagemId] = (necessarioEmb[it.embalagemId] || 0) + it.qtd;
+      }
+    });
+    for (const [produtoId, qtd] of Object.entries(necessario)) {
+      const prod = state.produtos.find(x => x.id === produtoId);
+      if (prod) prod.saldoPa = (Number(prod.saldoPa) || 0) + qtd;
+    }
+    for (const [embId, qtd] of Object.entries(necessarioEmb)) {
+      const emb = state.insumos.find(i => i.id === embId);
+      if (emb) emb.saldo = (Number(emb.saldo) || 0) + qtd;
+    }
+  }
+  // Cancelar conta a receber
+  state.contasReceber.forEach(c => {
+    if (c.pedidoId === pedidoId && c.status === 'ABERTA') c.status = 'CANCELADA';
+  });
+  // Cancelar OPs programadas/em andamento ainda não concluídas
+  state.ordens.forEach(o => {
+    if (o.pedidoOrigemId === pedidoId && o.status !== 'CONCLUIDA') {
+      o.status = 'CANCELADA';
+    }
+  });
+  // Marcar pedido
+  p.statusComercial = 'CANCELADO';
+  p.statusProdutivo = 'CANCELADO';
+  p.canceladoEm = new Date().toISOString();
+  p.motivoCancelamento = motivo;
+  logAuditoria('06_pedido', 'CANCELADO', p.id, `Pedido #${p.numero} cancelado · motivo: ${motivo}`);
+  persistState();
+  toast(`Pedido #${p.numero} cancelado · estoque estornado`);
+  fecharModal();
+  render();
+}
+
+// ----- Editar pedido existente (RASCUNHO ou CONFIRMADO) -------------------
+function editarPedido(pedidoId) {
+  const p = state.pedidos.find(x => x.id === pedidoId);
+  if (!p) return;
+  if (p.statusComercial === 'CANCELADO') {
+    toast('Pedido cancelado não pode ser editado', 'erro');
+    return;
+  }
+  if (p.statusComercial === 'PAGO' || p.statusComercial === 'FATURADO') {
+    toast(`Pedido com status ${p.statusComercial} não pode ser editado · cancele e refaça`, 'erro');
+    return;
+  }
+  const cli = state.clientes.find(c => c.id === p.clienteId);
+  // Snapshot dos itens originais para calcular diferenças no salvar
+  window._editPedSnapshot = {
+    id: pedidoId,
+    itensOriginais: JSON.parse(JSON.stringify(p.itens || [])),
+    statusOriginal: p.statusComercial,
+    totalOriginal: p.total
+  };
+  abrirModal(`
+    <h2 class="font-display text-xl mb-1">Editar pedido #${p.numero}</h2>
+    <p class="text-sm text-stone-500 mb-3">${cli?.nome || ''} · status: ${p.statusComercial}</p>
+
+    <form onsubmit="handleEditarPedido(event, '${pedidoId}')" class="space-y-3">
+
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="text-xs text-stone-600">Data de entrega</label>
+          <input name="dataEntrega" type="date" class="input" value="${p.dataEntrega || ''}"></div>
+        <div><label class="text-xs text-stone-600">Canal</label>
+          <select name="canal" class="input">
+            ${['whatsapp','telefone','representante','b2c','ecommerce'].map(c =>
+              `<option value="${c}" ${c===p.canal?'selected':''}>${c}</option>`).join('')}
+          </select></div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="text-xs text-stone-600">Forma de pagamento</label>
+          <select name="formaPagto" class="input">
+            <option value="">— sem definir —</option>
+            ${['dinheiro','pix','debito','credito','boleto','prazo'].map(f =>
+              `<option value="${f}" ${f===p.formaPagto?'selected':''}>${f}</option>`).join('')}
+          </select></div>
+        <div><label class="text-xs text-stone-600">Prazo (dias)</label>
+          <input name="prazoDias" type="number" min="0" class="input" value="${p.prazoDias || 0}"></div>
+      </div>
+
+      <div class="border-t border-stone-200 pt-3 mt-3">
+        <p class="module-tag mb-2">ITENS DO PEDIDO (edição livre)</p>
+        <p class="text-[11px] text-stone-500 mb-2">💡 Ajuste gramatura, qtd e preço. O preço unitário é recalculado automaticamente ao mudar gramatura — você pode sobrescrever digitando direto no campo.</p>
+        <table class="text-xs" id="tabela-itens-edicao">
+          <thead><tr>
+            <th>Produto</th>
+            <th>Embalagem</th>
+            <th class="text-right">Gramatura (g)</th>
+            <th class="text-right">Qtd</th>
+            <th class="text-right">Preço un.</th>
+            <th class="text-right">Subtotal</th>
+          </tr></thead>
+          <tbody>
+            ${p.itens.map((i, idx) => renderItemEdicaoRow(i, idx)).join('')}
+            <tr class="bg-stone-50" id="linha-total-pedido">
+              <td colspan="5" class="text-right font-medium">Total cobrado</td>
+              <td class="text-right num font-medium" id="total-pedido-edicao">${fmtBRL(p.total)}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div id="avisos-edicao" class="mt-2 space-y-1"></div>
+      </div>
+
+      <div class="flex justify-between items-center gap-2 pt-3">
+        <button type="button" class="btn btn-danger text-xs" onclick="cancelarPedido('${pedidoId}')">
+          <i data-lucide="x" class="w-3 h-3"></i> Cancelar pedido (estorna estoque)
+        </button>
+        <div class="flex gap-2">
+          <button type="button" class="btn" onclick="fecharModal()">Voltar</button>
+          <button type="submit" class="btn btn-primary">Salvar alterações</button>
+        </div>
+      </div>
+    </form>
+  `, 'lg');
+  if (typeof lucide!=='undefined') lucide.createIcons();
+  recalcularTotalEdicao();
+}
+
+// Renderiza linha de item editável (preserva ordem original via data-idx)
+function renderItemEdicaoRow(i, idx) {
+  const prod = state.produtos.find(x => x.id === i.produtoId);
+  const emb = i.embalagemId ? state.insumos.find(x => x.id === i.embalagemId) : null;
+  return `
+    <tr data-idx="${idx}" class="item-edicao">
+      <td>${prod?.nome || '—'}<br><span class="text-[10px] text-stone-500">${prod?.sku || ''}</span></td>
+      <td class="text-xs">${emb?.nome || '<span class="text-stone-400">fracionado</span>'}</td>
+      <td class="text-right">
+        <input type="number" min="1" step="1" value="${i.gramatura}"
+          data-original-gramatura="${i.gramatura}"
+          data-produto-id="${i.produtoId}"
+          class="input text-xs num text-right" style="width:80px;"
+          oninput="recalcularPrecoItemEdicao(${idx})">
+      </td>
+      <td class="text-right">
+        <input type="number" min="0" step="1" value="${i.qtd}"
+          class="input text-xs num text-right" style="width:60px;"
+          oninput="recalcularSubtotalItemEdicao(${idx})">
+      </td>
+      <td class="text-right">
+        <input type="number" min="0" step="0.01" value="${(i.preco||0).toFixed(2)}"
+          data-foi-editado="0"
+          class="input text-xs num text-right" style="width:90px;"
+          oninput="this.dataset.foiEditado='1'; recalcularSubtotalItemEdicao(${idx})">
+      </td>
+      <td class="text-right num font-medium" id="subtotal-edicao-${idx}">${fmtBRL((Number(i.qtd)||0) * (Number(i.preco)||0))}</td>
+    </tr>
+  `;
+}
+
+// Recalcula preço sugerido baseado em R$/g da ficha técnica × nova gramatura
+// (só se usuário não tiver editado manualmente o preço)
+function recalcularPrecoItemEdicao(idx) {
+  const row = document.querySelector(`tr.item-edicao[data-idx="${idx}"]`);
+  if (!row) return;
+  const inputGramatura = row.querySelector('input[data-original-gramatura]');
+  const inputPreco = row.querySelector('input[data-foi-editado]');
+  const produtoId = inputGramatura.dataset.produtoId;
+  const novaGramatura = parseFloat(inputGramatura.value) || 0;
+
+  if (inputPreco.dataset.foiEditado !== '1' && novaGramatura > 0) {
+    // Calcular preço sugerido = preçoEmbalagemCompleta / pesoLiq * gramatura, arredondado a R$ 0,10
+    const prod = state.produtos.find(x => x.id === produtoId);
+    const rec = state.receitas.find(rc => rc.produtoId === produtoId && rc.ativa);
+    if (prod && rec) {
+      const custo = calcularCustoReceita(rec.id);
+      const precoCompleto = custo ? calcularPrecoSugerido(custo.custoTotal) : 0;
+      const precoG = (precoCompleto / (prod.pesoLiq || 500)) * novaGramatura;
+      inputPreco.value = (Math.round(precoG * 10) / 10).toFixed(2);
+    }
+  }
+  recalcularSubtotalItemEdicao(idx);
+}
+
+// Recalcula só o subtotal de uma linha
+function recalcularSubtotalItemEdicao(idx) {
+  const row = document.querySelector(`tr.item-edicao[data-idx="${idx}"]`);
+  if (!row) return;
+  const inputs = row.querySelectorAll('input');
+  const gramatura = parseFloat(inputs[0].value) || 0;
+  const qtd = parseFloat(inputs[1].value) || 0;
+  const preco = parseFloat(inputs[2].value) || 0;
+  const sub = qtd * preco;
+  const cell = document.getElementById(`subtotal-edicao-${idx}`);
+  if (cell) cell.textContent = fmtBRL(sub);
+  recalcularTotalEdicao();
+}
+
+// Recalcula total geral + valida saldos disponíveis
+function recalcularTotalEdicao() {
+  let total = 0;
+  const snapshot = window._editPedSnapshot;
+  if (!snapshot) return;
+  // Diferenças por produto (em unidades equivalentes) e por embalagem
+  const difPA = {}; // produtoId → diferença (positiva = baixar mais, negativa = estornar)
+  const difEmb = {};
+  document.querySelectorAll('tr.item-edicao').forEach(row => {
+    const idx = parseInt(row.dataset.idx);
+    const inputs = row.querySelectorAll('input');
+    const gramatura = parseFloat(inputs[0].value) || 0;
+    const qtd = parseFloat(inputs[1].value) || 0;
+    const preco = parseFloat(inputs[2].value) || 0;
+    total += qtd * preco;
+    const original = snapshot.itensOriginais[idx];
+    if (!original) return;
+    const prod = state.produtos.find(x => x.id === original.produtoId);
+    if (!prod) return;
+    // Diferença de unidades equivalentes (gramatura × qtd) / pesoLiq
+    const unEqOriginal = (original.gramatura * original.qtd) / (prod.pesoLiq || 500);
+    const unEqNovo = (gramatura * qtd) / (prod.pesoLiq || 500);
+    const diff = unEqNovo - unEqOriginal;
+    if (diff !== 0) difPA[prod.id] = (difPA[prod.id] || 0) + diff;
+    // Diferença de embalagem (modo EMBALAGEM)
+    if (original.modo === 'EMBALAGEM' && original.embalagemId) {
+      const diffEmb = qtd - original.qtd;
+      if (diffEmb !== 0) difEmb[original.embalagemId] = (difEmb[original.embalagemId] || 0) + diffEmb;
+    }
+  });
+
+  // Atualizar total na tabela
+  const totalCell = document.getElementById('total-pedido-edicao');
+  if (totalCell) totalCell.textContent = fmtBRL(total);
+
+  // Validar saldos (avisar se estoque insuficiente para aumento)
+  const avisosBox = document.getElementById('avisos-edicao');
+  if (!avisosBox) return;
+  const alertas = [];
+  // Só validamos se status original já consumiu estoque (CONFIRMADO em diante)
+  if (snapshot.statusOriginal !== 'RASCUNHO') {
+    for (const [produtoId, diff] of Object.entries(difPA)) {
+      if (diff > 0) { // está pedindo MAIS do que antes
+        const prod = state.produtos.find(x => x.id === produtoId);
+        if (prod && prod.saldoPa < diff) {
+          alertas.push(`⚠ ${prod.nome}: precisa baixar mais ${fmtNum(diff,2)} un, mas tem só ${fmtNum(prod.saldoPa,2)} em estoque`);
+        }
+      }
+    }
+    for (const [embId, diffE] of Object.entries(difEmb)) {
+      if (diffE > 0) {
+        const emb = state.insumos.find(i => i.id === embId);
+        if (emb && emb.saldo < diffE) {
+          alertas.push(`⚠ ${emb.nome}: precisa baixar mais ${diffE} ${emb.unidade}, mas tem só ${emb.saldo}`);
+        }
+      }
+    }
+  }
+  avisosBox.innerHTML = alertas.length === 0
+    ? `<p class="text-[11px] text-brand-teal-900">✓ Saldos disponíveis suficientes para as alterações.</p>`
+    : alertas.map(a => `<p class="text-[11px]" style="color:#501313; background:#FCEBEB; padding:4px 8px; border-radius:4px;">${a}</p>`).join('');
+}
+
+function handleEditarPedido(ev, pedidoId) {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const p = state.pedidos.find(x => x.id === pedidoId);
+  if (!p) return;
+  const snapshot = window._editPedSnapshot;
+  if (!snapshot || snapshot.id !== pedidoId) {
+    toast('Estado de edição perdido — feche e tente novamente', 'erro');
+    return;
+  }
+
+  // Coletar novos valores dos itens
+  const novosItens = [];
+  const linhas = document.querySelectorAll('tr.item-edicao');
+  linhas.forEach(row => {
+    const idx = parseInt(row.dataset.idx);
+    const original = snapshot.itensOriginais[idx];
+    if (!original) return;
+    const inputs = row.querySelectorAll('input');
+    const gramatura = parseFloat(inputs[0].value) || 0;
+    const qtd = parseFloat(inputs[1].value) || 0;
+    const preco = parseFloat(inputs[2].value) || 0;
+    if (gramatura <= 0 || qtd <= 0 || preco < 0) return;
+    novosItens.push({
+      ...original, // preserva modo, embalagemId, produtoId
+      gramatura, qtd, preco
+    });
+  });
+  if (novosItens.length === 0) {
+    toast('O pedido precisa ter pelo menos um item', 'erro');
+    return;
+  }
+
+  // Calcular diferenças de estoque para aplicar (PA + embalagem)
+  const difPA = {};
+  const difEmb = {};
+  snapshot.itensOriginais.forEach((orig, idx) => {
+    const novo = novosItens[idx];
+    if (!novo) return;
+    const prod = state.produtos.find(x => x.id === orig.produtoId);
+    if (!prod) return;
+    const unEqOrig = (orig.gramatura * orig.qtd) / (prod.pesoLiq || 500);
+    const unEqNovo = (novo.gramatura * novo.qtd) / (prod.pesoLiq || 500);
+    const diff = unEqNovo - unEqOrig;
+    if (diff !== 0) difPA[prod.id] = (difPA[prod.id] || 0) + diff;
+    if (orig.modo === 'EMBALAGEM' && orig.embalagemId) {
+      const diffE = novo.qtd - orig.qtd;
+      if (diffE !== 0) difEmb[orig.embalagemId] = (difEmb[orig.embalagemId] || 0) + diffE;
+    }
+  });
+
+  // Aplicar diferenças NO ESTOQUE — só se pedido já estava CONFIRMADO (estoque foi consumido)
+  if (snapshot.statusOriginal !== 'RASCUNHO') {
+    // Validar saldos primeiro
+    for (const [produtoId, diff] of Object.entries(difPA)) {
+      if (diff > 0) {
+        const prod = state.produtos.find(x => x.id === produtoId);
+        if (prod && prod.saldoPa < diff) {
+          toast(`Saldo insuficiente para ${prod.nome} (precisa de mais ${fmtNum(diff,2)} un, tem ${fmtNum(prod.saldoPa,2)})`, 'erro');
+          return;
+        }
+      }
+    }
+    for (const [embId, diffE] of Object.entries(difEmb)) {
+      if (diffE > 0) {
+        const emb = state.insumos.find(i => i.id === embId);
+        if (emb && emb.saldo < diffE) {
+          toast(`Saldo de embalagem insuficiente: ${emb.nome}`, 'erro');
+          return;
+        }
+      }
+    }
+    // Aplicar
+    for (const [produtoId, diff] of Object.entries(difPA)) {
+      const prod = state.produtos.find(x => x.id === produtoId);
+      if (prod) prod.saldoPa = Math.max(0, (Number(prod.saldoPa) || 0) - diff);
+    }
+    for (const [embId, diffE] of Object.entries(difEmb)) {
+      const emb = state.insumos.find(i => i.id === embId);
+      if (emb) emb.saldo = Math.max(0, (Number(emb.saldo) || 0) - diffE);
+    }
+  }
+
+  // Atualizar pedido
+  p.itens = novosItens;
+  p.subtotal = novosItens.reduce((s, i) => s + (i.qtd * i.preco), 0);
+  // Preserva bonificação proporcional se total era arredondado? Por simplicidade, zera.
+  // Custo snapshot recalculado
+  let custoSnapshot = 0;
+  for (const it of novosItens) {
+    const prod = state.produtos.find(x => x.id === it.produtoId);
+    const r = state.receitas.find(rec => rec.produtoId === it.produtoId && rec.ativa);
+    if (r && prod) {
+      const c = calcularCustoReceita(r.id);
+      const fator = it.gramatura / (prod.pesoLiq || 500);
+      custoSnapshot += c.custoTotal * fator * it.qtd;
+    }
+    if (it.modo === 'EMBALAGEM' && it.embalagemId) {
+      const emb = state.insumos.find(ins => ins.id === it.embalagemId);
+      if (emb) custoSnapshot += (Number(emb.cmp) || 0) * it.qtd;
+    }
+  }
+  p.custoSnapshot = custoSnapshot;
+  // Total = subtotal (sem novo arredondamento) + bonificação anterior se houver
+  p.total = p.subtotal + (Number(p.bonificacao) || 0);
+
+  // Atualizar campos extra do form
+  p.dataEntrega = fd.get('dataEntrega') || p.dataEntrega;
+  p.canal = fd.get('canal') || p.canal;
+  p.formaPagto = fd.get('formaPagto') || '';
+  p.prazoDias = parseInt(fd.get('prazoDias')) || 0;
+
+  // Atualizar conta a receber
+  state.contasReceber.forEach(c => {
+    if (c.pedidoId === pedidoId && c.status === 'ABERTA') {
+      const dataCriacao = (p.criadoEm || '').slice(0, 10) || todayISO();
+      c.vencimento = addDaysISO(dataCriacao, p.prazoDias);
+      c.valor = p.total;
+    }
+  });
+
+  logAuditoria('06_pedido', 'EDITADO', p.id, `Pedido #${p.numero} editado · novo total ${fmtBRL(p.total)} · ${novosItens.length} item(ns)`);
+  delete window._editPedSnapshot;
+  persistState();
+  fecharModal();
+  toast(`Pedido #${p.numero} atualizado · total ${fmtBRL(p.total)}`);
   render();
 }
 
@@ -2910,10 +3683,10 @@ function renderColunaAgenda(titulo, pedidos, cor) {
             return `
               <div class="border-l-2 border-brand-${cor}-600 pl-3 py-1">
                 <div class="flex items-center justify-between">
-                  <p class="text-sm font-medium">#${p.numero} · ${cli?.nome || '⚠ cliente removido'}</p>
+                  <p class="text-sm font-medium">#${p.numero} · ${cli.nome}</p>
                   <p class="text-xs num">${fmtBRL(p.total)}</p>
                 </div>
-                <p class="text-xs text-stone-500">${(p.statusProdutivo||'').toLowerCase().replace('_',' ')}</p>
+                <p class="text-xs text-stone-500">${p.statusProdutivo.toLowerCase().replace('_',' ')}</p>
               </div>
             `;
           }).join('')}
@@ -3094,7 +3867,31 @@ function iniciarOP(opId) {
 function toggleFaseOP(opId, faseIdx) {
   const o = state.ordens.find(x => x.id === opId);
   if (!o || o.status !== 'EM_ANDAMENTO') return;
-  o.fases[faseIdx].concluida = !o.fases[faseIdx].concluida;
+  const fase = o.fases[faseIdx];
+  const agora = new Date().toISOString();
+  const operador = state.usuarioAtual?.nome || state.usuarioAtual?.email || 'operador';
+
+  if (!fase.concluida) {
+    // Marcando como concluída agora
+    // Define `fim` desta fase como agora
+    fase.fim = agora;
+    fase.operador = operador;
+    // Início desta fase = max(início da OP, fim da fase anterior, ou agora se nenhum)
+    if (!fase.inicio) {
+      const faseAnt = o.fases[faseIdx - 1];
+      fase.inicio = (faseAnt && faseAnt.fim) ? faseAnt.fim : (o.iniciadaEm || agora);
+    }
+    // Calcula duração em minutos
+    const inicioMs = new Date(fase.inicio).getTime();
+    const fimMs = new Date(fase.fim).getTime();
+    fase.duracaoMin = Math.max(0, Math.round((fimMs - inicioMs) / 60000));
+    fase.concluida = true;
+  } else {
+    // Desmarcando: limpa fim e duração, mas preserva inicio (pode reconcluir depois)
+    fase.fim = null;
+    fase.duracaoMin = null;
+    fase.concluida = false;
+  }
   persistState();
   render();
 }
@@ -3180,6 +3977,21 @@ function abrirDetalheOPConcluida(opId) {
   const o = state.ordens.find(x => x.id === opId);
   if (!o) return;
   const p = state.produtos.find(x => x.id === o.produtoId);
+  const r = state.receitas.find(rec => rec.produtoId === o.produtoId && rec.ativa);
+  // Tempo real = soma das durações das fases (em min)
+  const tempoRealMin = (o.fases || []).reduce((s, f) => s + (Number(f.duracaoMin) || 0), 0);
+  // Tempo teórico da ficha (em min) × proporção do lote vs rendimento da ficha
+  let tempoTeoricoMin = 0;
+  if (r && r.tempoH) {
+    const lotes = o.tamanhoLote / Math.max(r.rendimentoUn || 1, 1);
+    tempoTeoricoMin = Math.round(r.tempoH * 60 * lotes);
+  }
+  const pct = tempoTeoricoMin > 0 ? Math.round((tempoRealMin / tempoTeoricoMin) * 100) : null;
+  const fmtMin = m => {
+    const v = Math.round(Number(m) || 0);
+    if (v < 60) return v + ' min';
+    return Math.floor(v / 60) + 'h' + String(v % 60).padStart(2, '0');
+  };
   abrirModal(`
     <h2 class="font-display text-xl">OP-${o.numero}</h2>
     <p class="text-sm text-stone-500 mb-4">${p?.nome || '—'} · ${o.tamanhoLote} unidades</p>
@@ -3201,10 +4013,39 @@ function abrirDetalheOPConcluida(opId) {
         <p class="num font-medium text-brand-teal-900">${fmtBRL(o.custoUnitario || 0)}</p>
       </div>
     </div>
-    <p class="text-xs font-medium mb-1">Fases</p>
-    <ul class="text-xs space-y-1">
-      ${o.fases.map(f => `<li>${f.concluida ? '✓' : '○'} ${f.nome}</li>`).join('')}
-    </ul>
+
+    ${tempoTeoricoMin > 0 ? `
+      <div class="p-3 rounded text-xs mb-3" style="background:${pct > 110 ? '#FAEEDA' : pct < 90 ? '#E1F5EE' : '#EEEDFE'};">
+        <div class="flex justify-between items-center">
+          <span class="${pct > 110 ? 'text-brand-amber-900' : pct < 90 ? 'text-brand-teal-900' : 'text-brand-purple-900'}">
+            <strong>Tempo real:</strong> ${fmtMin(tempoRealMin)} · <strong>Teórico:</strong> ${fmtMin(tempoTeoricoMin)}
+          </span>
+          <span class="num font-medium ${pct > 110 ? 'text-brand-amber-900' : pct < 90 ? 'text-brand-teal-900' : 'text-brand-purple-900'}">
+            ${pct}% do esperado
+          </span>
+        </div>
+      </div>
+    ` : `
+      ${tempoRealMin > 0 ? `<p class="text-xs mb-2 text-stone-600"><strong>Tempo total real:</strong> ${fmtMin(tempoRealMin)}</p>` : ''}
+    `}
+
+    <p class="text-xs font-medium mb-2">Fases · cronometragem</p>
+    <table class="text-xs">
+      <thead><tr><th></th><th>Fase</th><th>Início</th><th>Fim</th><th class="text-right">Duração</th><th>Operador</th></tr></thead>
+      <tbody>
+        ${o.fases.map(f => `
+          <tr>
+            <td>${f.concluida ? '<span style="color:#1D9E75">✓</span>' : '<span style="color:#A8A39B">○</span>'}</td>
+            <td>${f.nome}</td>
+            <td class="text-xs text-stone-500">${f.inicio ? fmtDateTime(f.inicio) : '—'}</td>
+            <td class="text-xs text-stone-500">${f.fim ? fmtDateTime(f.fim) : '—'}</td>
+            <td class="text-right num">${f.duracaoMin != null ? fmtMin(f.duracaoMin) : '—'}</td>
+            <td class="text-xs text-stone-500">${f.operador || '—'}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+    <p class="text-[10px] text-stone-500 mt-2">⓵ Tempo de cada fase é cronometrado automaticamente entre o check da fase e o da fase anterior.</p>
     <div class="text-right mt-4"><button class="btn" onclick="fecharModal()">Fechar</button></div>
   `);
 }
@@ -3266,18 +4107,21 @@ function renderFinanceiro() {
   const saldo = totalReceber - totalPagar;
 
   return `
-    ${pageHeader('11', 'FINANCEIRO & DRE', 'Contas a pagar, receber e demonstrativo de resultado')}
+    ${pageHeader('11', 'FINANCEIRO & DRE', 'Contas, demonstrativo de resultado e fluxo de caixa')}
 
-    <div class="flex gap-2 mb-5 border-b border-[#E5E3DE]">
+    <div class="flex gap-2 mb-5 border-b border-[#E5E3DE] flex-wrap">
       <button class="btn text-xs ${aba==='contas' ? 'btn-primary' : ''}" style="border-radius:6px 6px 0 0; margin-bottom:-1px;" onclick="window._finAba='contas'; render()">
         <i data-lucide="list" class="w-3 h-3"></i> Contas a pagar/receber
       </button>
       <button class="btn text-xs ${aba==='dre' ? 'btn-primary' : ''}" style="border-radius:6px 6px 0 0; margin-bottom:-1px;" onclick="window._finAba='dre'; render()">
-        <i data-lucide="trending-up" class="w-3 h-3"></i> DRE · Demonstrativo de Resultado
+        <i data-lucide="trending-up" class="w-3 h-3"></i> DRE (regime de competência)
+      </button>
+      <button class="btn text-xs ${aba==='caixa' ? 'btn-primary' : ''}" style="border-radius:6px 6px 0 0; margin-bottom:-1px;" onclick="window._finAba='caixa'; render()">
+        <i data-lucide="wallet" class="w-3 h-3"></i> Fluxo de Caixa
       </button>
     </div>
 
-    ${aba === 'dre' ? renderDRE() : renderContas(abrirReceber, abrirPagar, totalReceber, totalPagar, saldo)}
+    ${aba === 'dre' ? renderDRE() : aba === 'caixa' ? renderFluxoCaixa() : renderContas(abrirReceber, abrirPagar, totalReceber, totalPagar, saldo)}
   `;
 }
 
@@ -3531,7 +4375,8 @@ function renderDRE() {
             <tr>
               <th class="sticky left-0 bg-stone-100 z-10">Conta</th>
               ${meses.map(m => `<th class="text-right text-[10px]">${m.nome}</th>`).join('')}
-              <th class="text-right bg-brand-purple-50 text-brand-purple-900">Total ${anoAlvo}</th>
+              <th class="text-right bg-brand-purple-50 text-brand-purple-900">Realizado ${anoAlvo}</th>
+              <th class="text-right bg-stone-100 text-stone-700">Projetado (mód. 3)</th>
             </tr>
           </thead>
           <tbody>
@@ -3540,16 +4385,17 @@ function renderDRE() {
             ${linhaDRE('(=) Receita líquida', meses.map(m=>m.receita), total.receita, 'text-brand-teal-900 font-medium bg-stone-50')}
             ${linhaDRE('(−) CPV — insumos + depreciação', meses.map(m=>-m.cpv), -total.cpv, 'text-brand-coral-900')}
             ${linhaDRE('(=) Lucro bruto', meses.map(m=>m.lucroBruto), total.lucroBruto, 'font-medium bg-stone-50')}
-            ${linhaDRE('(−) Despesas operacionais', meses.map(m=>-m.despesasOp), -total.despesasOp, 'text-stone-600')}
-            ${linhaDRE('(−) Folha (total)', meses.map(m=>-m.folhaTotal), -total.folhaTotal, 'text-stone-600 font-medium')}
+            ${linhaDRE('(−) Despesas operacionais (variáveis)', meses.map(m=>-m.despesasOp), -total.despesasOp, 'text-stone-600', -(Number(state.markup.custoVariavelMes)||0) * 12)}
+            ${linhaDRE('(−) Folha (total)', meses.map(m=>-m.folhaTotal), -total.folhaTotal, 'text-stone-600 font-medium', -(Number(state.markup.custoFixoMes)||0) * 12)}
             ${linhaDRE('     · Folha — contas pagas', meses.map(m=>-m.folhaContas), -total.folhaContas, 'text-stone-500 text-[10px]')}
             ${linhaDRE('     · Folha — MOD apropriado (operações)', meses.map(m=>-m.modApropriado), -total.modApropriado, 'text-stone-500 text-[10px]')}
             ${linhaDRE('(−) Utilidades (energia, água...)', meses.map(m=>-m.despesasUtilidades), -total.despesasUtilidades, 'text-stone-600')}
-            ${linhaDRE('(=) Lucro líquido do mês', meses.map(m=>m.lucroLiquido), total.lucroLiquido, 'font-display font-medium bg-brand-purple-50 text-brand-purple-900')}
+            ${linhaDRE('(=) Lucro líquido do mês', meses.map(m=>m.lucroLiquido), total.lucroLiquido, 'font-display font-medium bg-brand-purple-50 text-brand-purple-900', (Number(state.markup.margemLiquidaMes)||0) * 12)}
             <tr class="bg-stone-50">
               <td class="text-xs sticky left-0 bg-stone-50 z-10">% margem líquida</td>
               ${meses.map(m => `<td class="text-right text-[10px] num ${m.margemLiquida<0?'text-brand-coral-900':'text-stone-600'}">${m.margemLiquida.toFixed(1)}%</td>`).join('')}
               <td class="text-right num text-xs font-medium ${total.margemLiquida<0?'text-brand-coral-900':'text-brand-teal-900'}">${total.margemLiquida.toFixed(1)}%</td>
+              <td class="text-right num text-[11px] text-stone-500">—</td>
             </tr>
           </tbody>
         </table>
@@ -3558,17 +4404,164 @@ function renderDRE() {
 
     <p class="text-xs text-stone-500 mt-3">
       <i data-lucide="info" class="w-3 h-3 inline"></i>
-      Receita bruta dos itens = subtotal calculado de cada pedido (sem arredondamento) · Bonificações (±) = diferença do arredondamento aplicado no fechamento do pedido (+ recebida / − concedida) · CPV = insumos + depreciação · MOD das operações é apropriado em <strong>Folha</strong>, junto com contas a pagar categoria "folha" · Utilidades = contas categoria "utilidades" · Despesas operacionais = demais contas a pagar pagas no período.
+      <strong>Realizado</strong>: dados reais do período (pedidos e contas pagas). <strong>Projetado</strong>: valores configurados no módulo 3 (Precificação) multiplicados por 12 meses — útil para comparar o que você planejou vs o que aconteceu. Receita = pedidos confirmados/pagos · CPV = insumos + depreciação · MOD das operações entra em Folha · Despesas operacionais ≈ custos variáveis · Utilidades = contas categoria "utilidades".
     </p>
   `;
 }
 
-function linhaDRE(rotulo, valoresMensais, valorTotal, classes = '') {
+// ----- FLUXO DE CAIXA --------------------------------------------------------
+// Mostra entradas e saídas reais de dinheiro (regime de caixa):
+//  - Entradas: contas a receber pagas no mês
+//  - Saídas: contas a pagar pagas no mês + entradas de NF-e de insumos (compras)
+function calcularFluxoCaixa(anoAlvo) {
+  const meses = Array.from({length:12}, (_, i) => ({
+    mes: i+1, nome: ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'][i],
+    entradasReceber: 0, saidasPagar: 0, comprasInsumos: 0
+  }));
+  // Entradas: contas a receber PAGAS
+  state.contasReceber.forEach(c => {
+    if (c.status !== 'PAGA' || !c.pagoEm) return;
+    const dt = new Date(c.pagoEm);
+    if (dt.getFullYear() !== anoAlvo) return;
+    meses[dt.getMonth()].entradasReceber += Number(c.valor) || 0;
+  });
+  // Saídas: contas a pagar PAGAS
+  state.contasPagar.forEach(c => {
+    if (c.status !== 'PAGA' || !c.pagoEm) return;
+    const dt = new Date(c.pagoEm);
+    if (dt.getFullYear() !== anoAlvo) return;
+    meses[dt.getMonth()].saidasPagar += Number(c.valor) || 0;
+  });
+  // Compras de insumos (lançamentos do tipo ENTRADA em movimentos)
+  state.movimentos.forEach(m => {
+    if (m.tipo !== 'ENTRADA' || !m.data) return;
+    const dt = new Date(m.data);
+    if (dt.getFullYear() !== anoAlvo) return;
+    const valorEntrada = (Number(m.qtd) || 0) * (Number(m.custoUnit) || 0);
+    meses[dt.getMonth()].comprasInsumos += valorEntrada;
+  });
+  meses.forEach(m => {
+    m.totalEntradas = m.entradasReceber;
+    m.totalSaidas = m.saidasPagar + m.comprasInsumos;
+    m.saldo = m.totalEntradas - m.totalSaidas;
+  });
+  // Saldo acumulado
+  let acc = 0;
+  meses.forEach(m => { acc += m.saldo; m.saldoAcumulado = acc; });
+  const total = meses.reduce((acc, m) => ({
+    entradasReceber: acc.entradasReceber + m.entradasReceber,
+    saidasPagar: acc.saidasPagar + m.saidasPagar,
+    comprasInsumos: acc.comprasInsumos + m.comprasInsumos,
+    totalEntradas: acc.totalEntradas + m.totalEntradas,
+    totalSaidas: acc.totalSaidas + m.totalSaidas,
+    saldo: acc.saldo + m.saldo,
+  }), { entradasReceber:0, saidasPagar:0, comprasInsumos:0, totalEntradas:0, totalSaidas:0, saldo:0 });
+  total.saldoAcumulado = total.saldo;
+  return { meses, total };
+}
+
+function renderFluxoCaixa() {
+  const anoAtual = new Date().getFullYear();
+  const anoAlvo = window._caixaAno || anoAtual;
+  const { meses, total } = calcularFluxoCaixa(anoAlvo);
+  const anosDisp = new Set([anoAtual]);
+  state.contasReceber.forEach(c => c.pagoEm && anosDisp.add(new Date(c.pagoEm).getFullYear()));
+  state.contasPagar.forEach(c => c.pagoEm && anosDisp.add(new Date(c.pagoEm).getFullYear()));
+  state.movimentos.forEach(m => m.data && anosDisp.add(new Date(m.data).getFullYear()));
+  const anos = [...anosDisp].sort((a,b) => b-a);
+
+  return `
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <h3 class="font-display text-xl">Fluxo de Caixa (regime de caixa)</h3>
+        <p class="text-xs text-stone-500">Entradas e saídas reais de dinheiro · diferente da DRE que segue o regime de competência</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <label class="text-xs text-stone-600">Ano</label>
+        <select class="input text-xs" style="width:auto" onchange="window._caixaAno=parseInt(this.value); render()">
+          ${anos.map(a => `<option value="${a}" ${a===anoAlvo?'selected':''}>${a}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-4 gap-3 mb-5">
+      <div class="stat-card">
+        <p class="stat-label">Entradas (recebidos)</p>
+        <p class="stat-value num text-brand-teal-900">${fmtBRL(total.totalEntradas)}</p>
+        <p class="stat-hint">contas a receber pagas</p>
+      </div>
+      <div class="stat-card">
+        <p class="stat-label">Saídas (pagos + compras)</p>
+        <p class="stat-value num text-brand-coral-900">${fmtBRL(total.totalSaidas)}</p>
+        <p class="stat-hint">contas a pagar + NF-e insumos</p>
+      </div>
+      <div class="stat-card">
+        <p class="stat-label">Saldo do período</p>
+        <p class="stat-value num ${total.saldo >= 0 ? 'text-brand-teal-900' : 'text-brand-coral-900'}">${fmtBRL(total.saldo)}</p>
+        <p class="stat-hint">${total.saldo >= 0 ? 'caixa positivo' : 'caixa negativo'}</p>
+      </div>
+      <div class="stat-card">
+        <p class="stat-label">Compras de estoque ${anoAlvo}</p>
+        <p class="stat-value num text-stone-700">${fmtBRL(total.comprasInsumos)}</p>
+        <p class="stat-hint">NF-e de insumos recebidas</p>
+      </div>
+    </div>
+
+    <div class="card p-0 overflow-hidden">
+      <div class="overflow-x-auto">
+        <table>
+          <thead>
+            <tr>
+              <th class="sticky left-0 bg-stone-100 z-10">Movimento</th>
+              ${meses.map(m => `<th class="text-right text-[10px]">${m.nome}</th>`).join('')}
+              <th class="text-right bg-brand-purple-50 text-brand-purple-900">Total ${anoAlvo}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="text-brand-teal-900">
+              <td class="text-xs sticky left-0 bg-white z-10">(+) Recebimentos (clientes)</td>
+              ${meses.map(m => `<td class="text-right text-[11px] num">${m.entradasReceber !== 0 ? fmtBRL(m.entradasReceber) : '—'}</td>`).join('')}
+              <td class="text-right num text-xs font-medium">${fmtBRL(total.entradasReceber)}</td>
+            </tr>
+            <tr class="text-brand-coral-900">
+              <td class="text-xs sticky left-0 bg-white z-10">(−) Pagamentos (contas pagas)</td>
+              ${meses.map(m => `<td class="text-right text-[11px] num">${m.saidasPagar !== 0 ? fmtBRL(-m.saidasPagar) : '—'}</td>`).join('')}
+              <td class="text-right num text-xs font-medium">${fmtBRL(-total.saidasPagar)}</td>
+            </tr>
+            <tr class="text-brand-coral-900">
+              <td class="text-xs sticky left-0 bg-white z-10">(−) Compras de insumos (NF-e)</td>
+              ${meses.map(m => `<td class="text-right text-[11px] num">${m.comprasInsumos !== 0 ? fmtBRL(-m.comprasInsumos) : '—'}</td>`).join('')}
+              <td class="text-right num text-xs font-medium">${fmtBRL(-total.comprasInsumos)}</td>
+            </tr>
+            <tr class="font-display font-medium bg-brand-purple-50 text-brand-purple-900">
+              <td class="text-xs sticky left-0 bg-brand-purple-50 z-10">(=) Saldo do mês</td>
+              ${meses.map(m => `<td class="text-right text-[11px] num ${m.saldo<0?'text-brand-coral-900':''}">${m.saldo !== 0 ? fmtBRL(m.saldo) : '—'}</td>`).join('')}
+              <td class="text-right num text-xs font-medium">${fmtBRL(total.saldo)}</td>
+            </tr>
+            <tr class="bg-stone-50">
+              <td class="text-xs sticky left-0 bg-stone-50 z-10">Saldo acumulado</td>
+              ${meses.map(m => `<td class="text-right text-[11px] num ${m.saldoAcumulado<0?'text-brand-coral-900':'text-stone-600'}">${fmtBRL(m.saldoAcumulado)}</td>`).join('')}
+              <td class="text-right num text-xs font-medium">${fmtBRL(total.saldoAcumulado)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <p class="text-xs text-stone-500 mt-3">
+      <i data-lucide="info" class="w-3 h-3 inline"></i>
+      <strong>Fluxo de caixa</strong> mostra dinheiro entrando e saindo no período. Diferente da DRE (que considera o pedido como receita quando confirmado), aqui só conta quando o dinheiro de fato entrou (conta a receber paga) ou saiu (conta a pagar paga + NF-e de insumos). Útil para gestão do caixa diário.
+    </p>
+  `;
+}
+
+function linhaDRE(rotulo, valoresMensais, valorTotal, classes = '', projetado = null) {
   return `
     <tr class="${classes}">
       <td class="text-xs sticky left-0 z-10 ${classes.includes('bg-') ? '' : 'bg-white'}">${rotulo}</td>
       ${valoresMensais.map(v => `<td class="text-right text-[11px] num">${v !== 0 ? fmtBRL(v) : '—'}</td>`).join('')}
-      <td class="text-right num text-xs font-medium ${classes.includes('text-brand-purple-900') ? '' : ''}">${fmtBRL(valorTotal)}</td>
+      <td class="text-right num text-xs font-medium">${fmtBRL(valorTotal)}</td>
+      <td class="text-right num text-[11px] ${projetado != null ? 'text-stone-500' : 'text-stone-300'}">${projetado != null ? fmtBRL(projetado) : '—'}</td>
     </tr>
   `;
 }
@@ -3776,7 +4769,7 @@ function abrirModal(html, tamanho = 'md') {
       <div class="modal" style="max-width:${maxW}; padding:24px;">${html}</div>
     </div>
   `);
-  lucide.createIcons();
+  if (typeof lucide!=='undefined') lucide.createIcons();
 }
 function fecharModal() {
   document.getElementById('modal-overlay')?.remove();
@@ -3793,9 +4786,130 @@ function toast(msg, tipo = 'sucesso') {
 }
 
 // ============================================================================
-// INIT
+// INIT — Fluxo: 1) inicializa Supabase  2) verifica sessão  3) mostra login OU app
 // ============================================================================
-render();
+async function boot() {
+  // Espera Supabase JS carregar do CDN (até 8 segundos)
+  let tentativas = 0;
+  while (typeof supabase === 'undefined' && tentativas < 80) {
+    await new Promise(r => setTimeout(r, 100));
+    tentativas++;
+  }
+  if (!initSupabase()) {
+    document.body.innerHTML = `<div style="padding:40px;text-align:center;font-family:sans-serif">
+      <h2 style="font-family:Georgia,serif">Erro ao conectar com a nuvem</h2>
+      <p>Não foi possível carregar a biblioteca Supabase. Verifique sua conexão de internet.</p>
+      <button onclick="location.reload()" style="padding:10px 24px;background:#04342C;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer;margin-top:16px">Tentar novamente</button>
+    </div>`;
+    return;
+  }
+  const user = await checkAuth();
+  if (!user) {
+    mostrarTelaLogin();
+    return;
+  }
+  await iniciarApp(user);
+}
+
+function mostrarTelaLogin() {
+  document.body.innerHTML = `
+    <style>
+      body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+             background: linear-gradient(135deg, #F4F1EA 0%, #E8E3D8 100%); font-family: 'Geist', system-ui, sans-serif; }
+      .login-card { background:#FFF; padding:32px; border-radius:12px; box-shadow:0 4px 24px rgba(0,0,0,0.08);
+                    width:100%; max-width:380px; margin:20px; }
+      .login-card h1 { font-family:'Fraunces', serif; font-size:28px; margin:0 0 4px; color:#1F1E1D; }
+      .login-card .sub { font-size:13px; color:#6B6967; margin:0 0 24px; }
+      .login-card label { display:block; font-size:12px; color:#6B6967; margin:12px 0 4px; }
+      .login-card input { width:100%; padding:10px 12px; border:1px solid #D9D5CE; border-radius:6px;
+                         font-size:14px; box-sizing:border-box; font-family:inherit; }
+      .login-card input:focus { outline:none; border-color:#534AB7; }
+      .login-card button { width:100%; margin-top:20px; padding:12px; background:#04342C; color:#FFF;
+                          border:none; border-radius:6px; font-size:14px; font-weight:500; cursor:pointer; }
+      .login-card button:hover { background:#0F6E56; }
+      .login-card button:disabled { opacity:0.6; cursor:wait; }
+      .login-card .erro { color:#501313; background:#FCEBEB; padding:8px 12px; border-radius:6px;
+                          font-size:12px; margin-top:12px; display:none; }
+      .login-card .erro.show { display:block; }
+    </style>
+    <div class="login-card">
+      <h1>SequilhoPRO</h1>
+      <p class="sub">Pitchu Doces · acesso ao sistema</p>
+      <form id="login-form">
+        <label>Email</label>
+        <input type="email" name="email" required autocomplete="email" placeholder="seu@email.com">
+        <label>Senha</label>
+        <input type="password" name="password" required autocomplete="current-password" placeholder="••••••••">
+        <button type="submit" id="login-btn">Entrar</button>
+        <div class="erro" id="login-erro"></div>
+      </form>
+    </div>
+  `;
+  document.getElementById('login-form').onsubmit = async (ev) => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const btn = document.getElementById('login-btn');
+    const erro = document.getElementById('login-erro');
+    erro.classList.remove('show');
+    btn.disabled = true;
+    btn.textContent = 'Entrando…';
+    try {
+      const user = await loginUser(fd.get('email'), fd.get('password'));
+      // Login OK — recarrega a página para o boot rodar de novo (agora com sessão)
+      location.reload();
+    } catch (e) {
+      erro.textContent = 'Email ou senha incorretos. ' + (e.message || '');
+      erro.classList.add('show');
+      btn.disabled = false;
+      btn.textContent = 'Entrar';
+    }
+  };
+}
+
+async function iniciarApp(user) {
+  // Carrega dados do Supabase para popular o state
+  try {
+    const indicador = document.createElement('div');
+    indicador.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#534AB7;color:#FFF;text-align:center;padding:8px;font-size:13px;z-index:9999;font-family:sans-serif';
+    indicador.textContent = 'Carregando dados da nuvem…';
+    document.body.appendChild(indicador);
+    const novoState = await carregarStateDoSupabase();
+    state = novoState;
+    migrarState();
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch(e) {}
+    document.body.removeChild(indicador);
+  } catch (e) {
+    console.error('Erro carregando do Supabase:', e);
+    alert('Erro ao carregar dados da nuvem. Verifique sua conexão e tente novamente.\n\n' + (e.message || ''));
+    return;
+  }
+  // Renderiza app
+  render();
+  // Insere status sync + botão sair no header
+  setTimeout(injetarHeaderUsuario, 100);
+}
+
+function injetarHeaderUsuario() {
+  // Busca o header principal (vai variar conforme estrutura — coloca no topo da sidebar)
+  const sidebar = document.querySelector('aside');
+  if (!sidebar || document.getElementById('user-bar')) return;
+  const userBar = document.createElement('div');
+  userBar.id = 'user-bar';
+  userBar.style.cssText = 'padding:8px 12px; border-top:1px solid #E5E3DE; margin-top:auto; display:flex; flex-direction:column; gap:6px; font-size:11px;';
+  userBar.innerHTML = `
+    <div style="display:flex; align-items:center; gap:6px; color:#6B6967;">
+      <span id="sync-status"></span>
+    </div>
+    <button onclick="logoutUser()" style="background:none; border:1px solid #D9D5CE; padding:6px; border-radius:4px; color:#6B6967; cursor:pointer; font-size:11px;">
+      Sair (${state.usuarioAtual?.nome || 'usuário'})
+    </button>
+  `;
+  sidebar.appendChild(userBar);
+}
+
+// Dispara o boot
+boot();
 </script>
 </body>
 </html>
+
