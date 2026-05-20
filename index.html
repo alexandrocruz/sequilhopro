@@ -119,9 +119,9 @@ const FIELD_MAPS = {
     fromDb: { razao_social:'razaoSocial', nome_fantasia:'nomeFantasia', faixa_simples:'faixaSimples', ncm_padrao:'ncmPadrao', cfop_padrao:'cfopPadrao', nfe_serie:'nfeSerie', nfe_proximo_numero:'nfeProximoNumero' }
   },
   markup: {
-    allowed: ['id','modo','df','dv','ml','producao_mensal','custo_fixo_mes','custo_variavel_mes','margem_liquida_mes'],
-    toDb:   { producaoMensal:'producao_mensal', custoFixoMes:'custo_fixo_mes', custoVariavelMes:'custo_variavel_mes', margemLiquidaMes:'margem_liquida_mes' },
-    fromDb: { producao_mensal:'producaoMensal', custo_fixo_mes:'custoFixoMes', custo_variavel_mes:'custoVariavelMes', margem_liquida_mes:'margemLiquidaMes' }
+    allowed: ['id','modo','df','dv','ml','producao_mensal','custo_fixo_mes','custo_variavel_mes','margem_liquida_mes','markup_embalagem'],
+    toDb:   { producaoMensal:'producao_mensal', custoFixoMes:'custo_fixo_mes', custoVariavelMes:'custo_variavel_mes', margemLiquidaMes:'margem_liquida_mes', markupEmbalagem:'markup_embalagem' },
+    fromDb: { producao_mensal:'producaoMensal', custo_fixo_mes:'custoFixoMes', custo_variavel_mes:'custoVariavelMes', margem_liquida_mes:'margemLiquidaMes', markup_embalagem:'markupEmbalagem' }
   },
   produtos: {
     allowed: ['id','sku','nome','ncm','peso_liq','saldo_pa','minimo_pa'],
@@ -440,6 +440,7 @@ function seedData() {
       custoFixoMes: 0,
       custoVariavelMes: 0,
       margemLiquidaMes: 0,
+      markupEmbalagem: 30, // markup % aplicado sobre o CMP da embalagem ao vender
     },
   };
 }
@@ -490,6 +491,7 @@ function migrarState() {
   if (typeof state.markup.custoFixoMes !== 'number') state.markup.custoFixoMes = 4800;
   if (typeof state.markup.custoVariavelMes !== 'number') state.markup.custoVariavelMes = 1500;
   if (typeof state.markup.margemLiquidaMes !== 'number') state.markup.margemLiquidaMes = 3600;
+  if (typeof state.markup.markupEmbalagem !== 'number') state.markup.markupEmbalagem = 30;
   // 2) Pedidos — adicionar campo "tipo", gramatura, subtotal, bonificacao, modo e embalagemId
   if (Array.isArray(state.pedidos)) {
     state.pedidos.forEach(p => {
@@ -1804,12 +1806,43 @@ function handleSalvarFicha(ev, receitaId) {
 // MODULE 03 — MARKUP / PRECIFICAÇÃO
 // ============================================================================
 function renderMarkup() {
-  const produtoSelecionado = window._mkProdutoId || state.produtos[0].id;
-  const p = state.produtos.find(x => x.id === produtoSelecionado);
-  const r = state.receitas.find(rec => rec.produtoId === p.id && rec.ativa);
-  const custo = r ? calcularCustoReceita(r.id) : null;
   const m = state.markup;
   const modoValor = m.modo === 'VALOR_MENSAL';
+
+  // Bloco fixo da embalagem (independe de ter produto cadastrado)
+  const blocoEmbalagem = `
+    <div class="card mb-4">
+      <div class="flex items-start justify-between gap-4">
+        <div class="flex-1">
+          <h3 class="font-display text-lg">Markup das embalagens vendidas</h3>
+          <p class="text-xs text-stone-500">Acréscimo % aplicado sobre o CMP da embalagem quando vendida ao cliente (cenário "+ Embalagem do estoque" no novo pedido). Não afeta o markup do produto.</p>
+        </div>
+        <div class="text-center" style="min-width:160px;">
+          <p class="num text-2xl font-display">${m.markupEmbalagem}%</p>
+          <input type="range" min="0" max="100" step="1" value="${m.markupEmbalagem}"
+            oninput="state.markup.markupEmbalagem=parseInt(this.value); persistState(); render()"
+            class="w-full mt-1" style="accent-color:#1D9E75;">
+          <p class="text-[10px] text-stone-500 mt-1">CMP × ${(1 + m.markupEmbalagem/100).toFixed(2)}</p>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Se não há produtos, mostra só o bloco da embalagem
+  if (state.produtos.length === 0) {
+    return `
+      ${pageHeader('03', 'PRECIFICAÇÃO', 'Composição do preço sugerido')}
+      ${blocoEmbalagem}
+      <div class="card text-center text-stone-500 py-8">
+        <p class="text-sm">Cadastre produtos no módulo 2 para configurar markup e simular preços.</p>
+      </div>
+    `;
+  }
+
+  const produtoSelecionado = window._mkProdutoId || state.produtos[0].id;
+  const p = state.produtos.find(x => x.id === produtoSelecionado) || state.produtos[0];
+  const r = state.receitas.find(rec => rec.produtoId === p.id && rec.ativa);
+  const custo = r ? calcularCustoReceita(r.id) : null;
 
   const calc = custo ? (modoValor
     ? calcularComposicaoValor(custo.custoTotal, m)
@@ -1817,6 +1850,7 @@ function renderMarkup() {
 
   return `
     ${pageHeader('03', 'PRECIFICAÇÃO', 'Composição do preço sugerido')}
+    ${blocoEmbalagem}
 
     <div class="card mb-4 flex items-center justify-between gap-4">
       <div class="flex-1">
@@ -2114,22 +2148,26 @@ function abrirDetalhePedido(pedidoId) {
       <thead><tr><th>Produto</th><th>Embalagem</th><th class="text-right">Gramatura</th><th class="text-right">Pacotes</th><th class="text-right">Preço un.</th><th class="text-right">Subtotal</th><th class="text-right">Equiv. embal.</th></tr></thead>
       <tbody>
         ${p.itens.map(i => {
-          const prod = state.produtos.find(x => x.id === i.produtoId);
-          const gramatura = i.gramatura || prod?.pesoLiq || 500;
-          const unEq = (i.qtd * gramatura) / (prod?.pesoLiq || 500);
+          const prod = i.produtoId ? state.produtos.find(x => x.id === i.produtoId) : null;
+          const gramatura = i.gramatura || prod?.pesoLiq || 0;
+          const unEq = prod ? (i.qtd * gramatura) / (prod.pesoLiq || 500) : 0;
           const emb = i.embalagemId ? state.insumos.find(x => x.id === i.embalagemId) : null;
           const embLabel = emb
             ? `<span class="text-xs">${emb.nome}</span>`
             : `<span class="text-xs text-stone-400">— fracionado —</span>`;
+          // Nome a exibir: se tem produto, é o produto. Se não, é "Embalagem vazia (nome da embalagem)".
+          const nomeExibir = prod
+            ? `<strong>${prod.nome}</strong> <span class="text-xs text-stone-500 block">${prod.sku}</span>`
+            : `<em class="text-stone-500">${emb?.nome || 'Embalagem'}</em> <span class="text-xs text-stone-400 block">só embalagem</span>`;
           return `
             <tr>
-              <td><strong>${prod.nome}</strong> <span class="text-xs text-stone-500 block">${prod.sku}</span></td>
+              <td>${nomeExibir}</td>
               <td>${embLabel}</td>
-              <td class="text-right num">${gramatura}g</td>
+              <td class="text-right num">${gramatura > 0 ? gramatura + 'g' : '—'}</td>
               <td class="text-right num">${i.qtd}</td>
               <td class="text-right num">${fmtBRL(i.preco)}</td>
               <td class="text-right num font-medium">${fmtBRL(i.qtd * i.preco)}</td>
-              <td class="text-right num text-xs text-stone-500">${fmtNum(unEq, 2)} un</td>
+              <td class="text-right num text-xs text-stone-500">${prod ? fmtNum(unEq, 2) + ' un' : '—'}</td>
             </tr>
           `;
         }).join('')}
@@ -2315,7 +2353,7 @@ function abrirModalNovoPedido() {
   // NOTA: o usuário pediu "sempre perguntar, sem default" — por isso não pré-marcamos
 }
 
-// ----- Adicionar item: EMBALAGEM DO ESTOQUE (escolha insumo embalagem + produto) -----
+// ----- Adicionar item: EMBALAGEM DO ESTOQUE (embalagem + opcionalmente produto) -----
 function addItemPedidoEmbalagem() {
   const embalagensComSaldo = state.insumos.filter(i =>
     ['EMBALAGEM_PRIMARIA','EMBALAGEM_SECUNDARIA','EMBALAGEM_PROPORCIONAL'].includes(i.tipo) && i.saldo > 0
@@ -2324,56 +2362,89 @@ function addItemPedidoEmbalagem() {
     toast('Nenhuma embalagem com saldo em estoque · cadastre no módulo de insumos ou use "+ Item fracionado"', 'erro');
     return;
   }
-  if (state.produtos.length === 0) {
-    toast('Cadastre ao menos um produto no módulo 2 antes de criar pedidos', 'erro');
-    return;
-  }
   const idx = ++window._pedItemIdx;
   const embInicial = embalagensComSaldo[0];
-  const prodInicial = state.produtos[0];
-  // Calcula preço sugerido inicial
-  const precoInicial = precoSugeridoEmbalagem(embInicial.id, prodInicial.id);
+  // Sem produto por padrão — vendedor decide se quer adicionar
   const row = document.createElement('div');
   row.className = 'pedido-item';
   row.dataset.idx = idx;
   row.dataset.modo = 'EMBALAGEM';
-  row.innerHTML = renderItemEmbalagem(idx, embInicial.id, prodInicial.id, 1, precoInicial);
+  row.innerHTML = renderItemEmbalagem(idx, embInicial.id, '', null, 1, 0);
   document.getElementById('pedido-itens').appendChild(row);
   document.getElementById('pedido-itens-vazio').style.display = 'none';
   if (typeof lucide!=='undefined') lucide.createIcons();
-  atualizarComposicaoEmbalagem(idx);
-  atualizarResumoPedido();
+  recalcularPrecoEmbalagem(idx);
 }
 
-// Calcula preço sugerido: custo do produto na gramatura + custo da embalagem, aplicando markup
-function precoSugeridoEmbalagem(embalagemId, produtoId) {
+// Calcula preço sugerido = (CMP embalagem × (1+markupEmb/100)) + custo_produto_na_gramatura × markup_normal
+function precoSugeridoEmbalagem(embalagemId, produtoId, gramatura) {
   const emb = state.insumos.find(i => i.id === embalagemId);
-  const prod = state.produtos.find(p => p.id === produtoId);
-  if (!emb || !prod) return 0;
-  const r = state.receitas.find(rec => rec.produtoId === prod.id && rec.ativa);
-  if (!r) return 0;
-  const custo = calcularCustoReceita(r.id);
-  if (!custo) return 0;
-  const gramatura = inferirGramaturaDaEmbalagem(emb, prod);
-  const custoProdutoNaGramatura = custo.custoTotal * (gramatura / (prod.pesoLiq || 500));
-  const custoEmbalagem = Number(emb.cmp) || 0;
-  const custoTotalItem = custoProdutoNaGramatura + custoEmbalagem;
-  return Math.round(calcularPrecoSugerido(custoTotalItem) * 10) / 10;
+  if (!emb) return 0;
+  const markupEmb = 1 + (Number(state.markup.markupEmbalagem) || 30) / 100;
+  let preco = (Number(emb.cmp) || 0) * markupEmb;
+  if (produtoId && gramatura > 0) {
+    const prod = state.produtos.find(p => p.id === produtoId);
+    const r = state.receitas.find(rec => rec.produtoId === produtoId && rec.ativa);
+    if (prod && r) {
+      const custo = calcularCustoReceita(r.id);
+      if (custo) {
+        const custoProdGramatura = custo.custoTotal * (gramatura / (prod.pesoLiq || 500));
+        // Aplica o markup do produto (modo do módulo 3)
+        preco += calcularPrecoSugerido(custoProdGramatura);
+      }
+    }
+  }
+  return Math.round(preco * 10) / 10; // arredonda a R$ 0,10
 }
 
-function renderItemEmbalagem(idx, embalagemId, produtoId, qtd, preco) {
+function renderItemEmbalagem(idx, embalagemId, produtoId, gramatura, qtd, preco) {
   const embalagensComSaldo = state.insumos.filter(i =>
     ['EMBALAGEM_PRIMARIA','EMBALAGEM_SECUNDARIA','EMBALAGEM_PROPORCIONAL'].includes(i.tipo) && i.saldo > 0
   );
   const emb = state.insumos.find(i => i.id === embalagemId);
-  const prod = state.produtos.find(p => p.id === produtoId);
+  const prod = produtoId ? state.produtos.find(p => p.id === produtoId) : null;
   const tipoLabel = {
     'EMBALAGEM_PRIMARIA':'primária',
     'EMBALAGEM_SECUNDARIA':'secundária',
     'EMBALAGEM_PROPORCIONAL':'proporcional'
   }[emb?.tipo] || '';
-  // Gramatura inferida do nome (regex "Xg") ou peso completo do produto
-  const gramaturaInferida = inferirGramaturaDaEmbalagem(emb, prod);
+  const markupEmb = Number(state.markup.markupEmbalagem) || 30;
+
+  // Chips de gramatura SÓ aparecem se houver produto selecionado
+  let blocoGramatura = '';
+  if (prod) {
+    const peso = prod.pesoLiq || 500;
+    const chips = [];
+    for (let g = 50; g <= peso; g += 50) {
+      const ePesoCompleto = g === peso;
+      chips.push({ g, label: g + 'g', destaque: ePesoCompleto, sub: ePesoCompleto ? 'embal.' : '' });
+    }
+    [2,3,4,5].forEach(m => {
+      chips.push({ g: peso*m, label: (peso*m)+'g', sub: m+'× embal.', destaque: false });
+    });
+    blocoGramatura = `
+      <div class="mb-2">
+        <p class="text-[10px]" style="color:#04342C;">Gramatura do produto (a cada 50g)</p>
+        <div id="chips-emb-${idx}" class="grid gap-1 mt-1" style="grid-template-columns: repeat(6, 1fr);">
+          ${chips.map(c => {
+            const ativo = gramatura && Number(gramatura) === c.g;
+            let style = 'cursor:pointer; border-radius:6px; text-align:center; padding:5px 3px;';
+            if (ativo) style += ' border:2px solid #534AB7; background:#EEEDFE;';
+            else if (c.destaque) style += ' border:1px solid #1D9E75; background:#fff;';
+            else style += ' border:1px solid #D9D5CE; background:#fff;';
+            const corLabel = ativo ? '#26215C' : (c.destaque ? '#04342C' : '#1F1E1D');
+            return `
+              <div class="chip-emb-g" style="${style}" onclick="selecionarGramaturaEmbalagem(${idx}, ${c.g})">
+                <p class="text-xs font-medium" style="color:${corLabel}; margin:0;">${c.label}${ativo?' ✓':''}</p>
+                ${c.sub ? `<p class="text-[9px]" style="color:#6B6967; margin:0;">${c.sub}</p>` : ''}
+              </div>
+            `;
+          }).join('')}
+        </div>
+      </div>
+    `;
+  }
+
   return `
     <div class="border rounded-md p-3" style="border-color:#1D9E75; background:#E1F5EE;">
       <div class="flex items-center justify-between mb-2">
@@ -2391,21 +2462,22 @@ function renderItemEmbalagem(idx, embalagemId, produtoId, qtd, preco) {
           <select name="embalagemId_${idx}" class="input text-xs"
             onchange="recalcularPrecoEmbalagem(${idx})">
             ${embalagensComSaldo.map(e => `
-              <option value="${e.id}" ${e.id===embalagemId?'selected':''}>${e.nome} — ${fmtNum(e.saldo,0)} ${e.unidade} disp. <span>(${ {EMBALAGEM_PRIMARIA:'prim.',EMBALAGEM_SECUNDARIA:'sec.',EMBALAGEM_PROPORCIONAL:'prop.'}[e.tipo] || ''})</span></option>
+              <option value="${e.id}" ${e.id===embalagemId?'selected':''}>${e.nome} — ${fmtNum(e.saldo,0)} ${e.unidade} disp. (${ {EMBALAGEM_PRIMARIA:'prim.',EMBALAGEM_SECUNDARIA:'sec.',EMBALAGEM_PROPORCIONAL:'prop.'}[e.tipo] || ''})</option>
             `).join('')}
           </select>
         </div>
         <div>
           <p class="text-[10px]" style="color:#04342C;">Saldo emb.</p>
-          <p class="num font-medium text-sm" id="saldo-emb-${idx}" style="color:#04342C; padding-top:6px;">${fmtNum(emb?.saldo || 0, 0)} ${emb?.unidade || 'un'}</p>
+          <p class="num font-medium text-sm" style="color:#04342C; padding-top:6px;">${fmtNum(emb?.saldo || 0, 0)} ${emb?.unidade || 'un'}</p>
         </div>
       </div>
 
       <div class="grid gap-2 mb-2" style="grid-template-columns: 2fr 90px;">
         <div>
-          <p class="text-[10px]" style="color:#04342C;">Produto que vai dentro</p>
+          <p class="text-[10px]" style="color:#04342C;">Produto que vai dentro (opcional)</p>
           <select name="produtoId_${idx}" class="input text-xs"
             onchange="recalcularPrecoEmbalagem(${idx})">
+            <option value="">— sem produto (só a embalagem) —</option>
             ${state.produtos.map(p => `
               <option value="${p.id}" ${p.id===produtoId?'selected':''}>${p.nome} (saldo PA ${fmtNum(p.saldoPa, 2)})</option>
             `).join('')}
@@ -2413,11 +2485,13 @@ function renderItemEmbalagem(idx, embalagemId, produtoId, qtd, preco) {
         </div>
         <div>
           <p class="text-[10px]" style="color:#04342C;">Saldo PA</p>
-          <p class="num font-medium text-sm" id="saldo-pa-${idx}" style="color:#04342C; padding-top:6px;">${fmtNum(prod?.saldoPa || 0, 2)} un</p>
+          <p class="num font-medium text-sm" style="color:#04342C; padding-top:6px;">${prod ? fmtNum(prod.saldoPa, 2) + ' un' : '—'}</p>
         </div>
       </div>
 
-      <input type="hidden" name="gramatura_${idx}" value="${gramaturaInferida}">
+      ${blocoGramatura}
+
+      <input type="hidden" name="gramatura_${idx}" value="${gramatura || (prod?.pesoLiq || 0)}">
       <input type="hidden" name="modo_${idx}" value="EMBALAGEM">
 
       <div class="grid gap-2" style="grid-template-columns: 90px 130px 1fr;">
@@ -2439,29 +2513,35 @@ function renderItemEmbalagem(idx, embalagemId, produtoId, qtd, preco) {
 
       <p class="text-[11px] mt-2" id="composicao-emb-${idx}" style="color:#0F6E56;">
         <i data-lucide="info" class="w-3 h-3 inline"></i>
-        Tipo: ${tipoLabel} · ${gramaturaInferida}g · baixa: 1 ${emb?.unidade || 'un'} de embalagem + ${gramaturaInferida}g de produto por pacote
+        Tipo: ${tipoLabel} · ${prod ? 'com produto' : 'só embalagem'} · markup embalagem ${markupEmb}%
       </p>
     </div>
   `;
 }
 
-// Extrai a gramatura do nome da embalagem (procura "Xg" ou "X g") ou usa pesoLiq do produto
-function inferirGramaturaDaEmbalagem(emb, prod) {
-  if (!emb) return prod?.pesoLiq || 500;
-  const match = emb.nome.match(/(\d+(?:[.,]\d+)?)\s*g\b/i);
-  if (match) return parseFloat(match[1].replace(',', '.'));
-  return prod?.pesoLiq || 500;
+function selecionarGramaturaEmbalagem(idx, gramatura) {
+  const row = document.querySelector(`.pedido-item[data-idx="${idx}"]`);
+  if (!row) return;
+  row.querySelector(`[name="gramatura_${idx}"]`).value = gramatura;
+  recalcularPrecoEmbalagem(idx);
 }
 
 function recalcularPrecoEmbalagem(idx) {
   const row = document.querySelector(`.pedido-item[data-idx="${idx}"]`);
   if (!row) return;
   const embId = row.querySelector(`[name="embalagemId_${idx}"]`).value;
-  const prodId = row.querySelector(`[name="produtoId_${idx}"]`).value;
+  const prodId = row.querySelector(`[name="produtoId_${idx}"]`).value || '';
   const qtd = parseFloat(row.querySelector(`[name="qtd_${idx}"]`).value) || 1;
-  const precoSugerido = precoSugeridoEmbalagem(embId, prodId);
-  // Regerar a row preservando qtd
-  row.innerHTML = renderItemEmbalagem(idx, embId, prodId, qtd, precoSugerido);
+  let gramatura = parseFloat(row.querySelector(`[name="gramatura_${idx}"]`).value) || 0;
+  // Se trocou para um produto novo e gramatura ainda não foi escolhida, usa o pesoLiq do produto
+  if (prodId) {
+    const prod = state.produtos.find(p => p.id === prodId);
+    if (prod && (!gramatura || gramatura <= 0)) gramatura = prod.pesoLiq || 500;
+  } else {
+    gramatura = 0; // sem produto, sem gramatura
+  }
+  const precoSugerido = precoSugeridoEmbalagem(embId, prodId, gramatura);
+  row.innerHTML = renderItemEmbalagem(idx, embId, prodId, gramatura, qtd, precoSugerido);
   if (typeof lucide!=='undefined') lucide.createIcons();
   atualizarComposicaoEmbalagem(idx);
   atualizarResumoPedido();
@@ -2473,25 +2553,31 @@ function atualizarComposicaoEmbalagem(idx) {
   const box = document.getElementById(`composicao-emb-${idx}`);
   if (!box) return;
   const embId = row.querySelector(`[name="embalagemId_${idx}"]`).value;
-  const prodId = row.querySelector(`[name="produtoId_${idx}"]`).value;
+  const prodId = row.querySelector(`[name="produtoId_${idx}"]`).value || '';
   const emb = state.insumos.find(i => i.id === embId);
-  const prod = state.produtos.find(p => p.id === prodId);
-  if (!emb || !prod) return;
-  const gramatura = parseFloat(row.querySelector(`[name="gramatura_${idx}"]`).value) || inferirGramaturaDaEmbalagem(emb, prod);
+  const prod = prodId ? state.produtos.find(p => p.id === prodId) : null;
+  if (!emb) return;
+  const gramatura = parseFloat(row.querySelector(`[name="gramatura_${idx}"]`).value) || 0;
   const preco = parseFloat(row.querySelector(`[name="preco_${idx}"]`).value) || 0;
-  const r = state.receitas.find(rec => rec.produtoId === prod.id && rec.ativa);
-  const custoProd = r ? calcularCustoReceita(r.id).custoTotal * (gramatura / (prod.pesoLiq || 500)) : 0;
-  const custoEmb = Number(emb.cmp) || 0;
-  const custoTotal = custoProd + custoEmb;
+  const markupEmb = Number(state.markup.markupEmbalagem) || 30;
+  const cmpEmb = Number(emb.cmp) || 0;
+  const valorEmbComMarkup = cmpEmb * (1 + markupEmb/100);
+  let custoProd = 0;
+  if (prod && gramatura > 0) {
+    const r = state.receitas.find(rec => rec.produtoId === prod.id && rec.ativa);
+    if (r) custoProd = calcularCustoReceita(r.id).custoTotal * (gramatura / (prod.pesoLiq || 500));
+  }
+  const custoTotal = cmpEmb + custoProd;
   const margemRS = preco - custoTotal;
   const margemPct = preco > 0 ? (margemRS / preco) * 100 : 0;
   const tipoLabel = {EMBALAGEM_PRIMARIA:'primária',EMBALAGEM_SECUNDARIA:'secundária',EMBALAGEM_PROPORCIONAL:'proporcional'}[emb.tipo] || '';
   box.innerHTML = `
     <i data-lucide="info" class="w-3 h-3 inline"></i>
-    Tipo ${tipoLabel} · custo produto ${fmtBRL(custoProd)} + embalagem ${fmtBRL(custoEmb)} = ${fmtBRL(custoTotal)} · margem ${margemPct.toFixed(1)}%
+    ${tipoLabel} · emb. ${fmtBRL(cmpEmb)} × ${(1+markupEmb/100).toFixed(2)} = ${fmtBRL(valorEmbComMarkup)}${prod ? ' + produto ' + gramatura + 'g (custo ' + fmtBRL(custoProd) + ')' : ''} · margem total ${margemPct.toFixed(1)}%
   `;
   if (typeof lucide!=='undefined') lucide.createIcons();
 }
+
 
 // ----- Adicionar item: FRACIONADO (granel com chips) ------------------------
 function addItemPedidoFracionado() {
@@ -2834,8 +2920,18 @@ function handleNovoPedido(ev) {
     // Embalagem só existe quando modo === 'EMBALAGEM'
     const embalagemEl = row.querySelector(`[name="embalagemId_${idx}"]`);
     const embalagemId = embalagemEl ? embalagemEl.value : null;
-    if (produtoId && gramatura > 0 && qtd > 0 && preco > 0) {
-      itens.push({ produtoId, gramatura, qtd, preco, modo, embalagemId });
+    // Validação:
+    //  - Item FRACIONADO precisa ter produto + gramatura
+    //  - Item EMBALAGEM precisa ter embalagemId; produto e gramatura são opcionais
+    const valido = (modo === 'EMBALAGEM')
+      ? (embalagemId && qtd > 0 && preco > 0)
+      : (produtoId && gramatura > 0 && qtd > 0 && preco > 0);
+    if (valido) {
+      itens.push({
+        produtoId: produtoId || null,
+        gramatura: gramatura || 0,
+        qtd, preco, modo, embalagemId
+      });
     }
   });
   if (itens.length === 0) { toast('Adicione pelo menos um item', 'erro'); return; }
@@ -4123,18 +4219,21 @@ function renderFinanceiro() {
   const saldo = totalReceber - totalPagar;
 
   return `
-    ${pageHeader('11', 'FINANCEIRO & DRE', 'Contas a pagar, receber e demonstrativo de resultado')}
+    ${pageHeader('11', 'FINANCEIRO & DRE', 'Contas, demonstrativo de resultado e fluxo de caixa')}
 
-    <div class="flex gap-2 mb-5 border-b border-[#E5E3DE]">
+    <div class="flex gap-2 mb-5 border-b border-[#E5E3DE] flex-wrap">
       <button class="btn text-xs ${aba==='contas' ? 'btn-primary' : ''}" style="border-radius:6px 6px 0 0; margin-bottom:-1px;" onclick="window._finAba='contas'; render()">
         <i data-lucide="list" class="w-3 h-3"></i> Contas a pagar/receber
       </button>
       <button class="btn text-xs ${aba==='dre' ? 'btn-primary' : ''}" style="border-radius:6px 6px 0 0; margin-bottom:-1px;" onclick="window._finAba='dre'; render()">
-        <i data-lucide="trending-up" class="w-3 h-3"></i> DRE · Demonstrativo de Resultado
+        <i data-lucide="trending-up" class="w-3 h-3"></i> DRE (regime de competência)
+      </button>
+      <button class="btn text-xs ${aba==='caixa' ? 'btn-primary' : ''}" style="border-radius:6px 6px 0 0; margin-bottom:-1px;" onclick="window._finAba='caixa'; render()">
+        <i data-lucide="wallet" class="w-3 h-3"></i> Fluxo de Caixa
       </button>
     </div>
 
-    ${aba === 'dre' ? renderDRE() : renderContas(abrirReceber, abrirPagar, totalReceber, totalPagar, saldo)}
+    ${aba === 'dre' ? renderDRE() : aba === 'caixa' ? renderFluxoCaixa() : renderContas(abrirReceber, abrirPagar, totalReceber, totalPagar, saldo)}
   `;
 }
 
@@ -4388,7 +4487,8 @@ function renderDRE() {
             <tr>
               <th class="sticky left-0 bg-stone-100 z-10">Conta</th>
               ${meses.map(m => `<th class="text-right text-[10px]">${m.nome}</th>`).join('')}
-              <th class="text-right bg-brand-purple-50 text-brand-purple-900">Total ${anoAlvo}</th>
+              <th class="text-right bg-brand-purple-50 text-brand-purple-900">Realizado ${anoAlvo}</th>
+              <th class="text-right bg-stone-100 text-stone-700">Projetado (mód. 3)</th>
             </tr>
           </thead>
           <tbody>
@@ -4397,16 +4497,17 @@ function renderDRE() {
             ${linhaDRE('(=) Receita líquida', meses.map(m=>m.receita), total.receita, 'text-brand-teal-900 font-medium bg-stone-50')}
             ${linhaDRE('(−) CPV — insumos + depreciação', meses.map(m=>-m.cpv), -total.cpv, 'text-brand-coral-900')}
             ${linhaDRE('(=) Lucro bruto', meses.map(m=>m.lucroBruto), total.lucroBruto, 'font-medium bg-stone-50')}
-            ${linhaDRE('(−) Despesas operacionais', meses.map(m=>-m.despesasOp), -total.despesasOp, 'text-stone-600')}
-            ${linhaDRE('(−) Folha (total)', meses.map(m=>-m.folhaTotal), -total.folhaTotal, 'text-stone-600 font-medium')}
+            ${linhaDRE('(−) Despesas operacionais (variáveis)', meses.map(m=>-m.despesasOp), -total.despesasOp, 'text-stone-600', -(Number(state.markup.custoVariavelMes)||0) * 12)}
+            ${linhaDRE('(−) Folha (total)', meses.map(m=>-m.folhaTotal), -total.folhaTotal, 'text-stone-600 font-medium', -(Number(state.markup.custoFixoMes)||0) * 12)}
             ${linhaDRE('     · Folha — contas pagas', meses.map(m=>-m.folhaContas), -total.folhaContas, 'text-stone-500 text-[10px]')}
             ${linhaDRE('     · Folha — MOD apropriado (operações)', meses.map(m=>-m.modApropriado), -total.modApropriado, 'text-stone-500 text-[10px]')}
             ${linhaDRE('(−) Utilidades (energia, água...)', meses.map(m=>-m.despesasUtilidades), -total.despesasUtilidades, 'text-stone-600')}
-            ${linhaDRE('(=) Lucro líquido do mês', meses.map(m=>m.lucroLiquido), total.lucroLiquido, 'font-display font-medium bg-brand-purple-50 text-brand-purple-900')}
+            ${linhaDRE('(=) Lucro líquido do mês', meses.map(m=>m.lucroLiquido), total.lucroLiquido, 'font-display font-medium bg-brand-purple-50 text-brand-purple-900', (Number(state.markup.margemLiquidaMes)||0) * 12)}
             <tr class="bg-stone-50">
               <td class="text-xs sticky left-0 bg-stone-50 z-10">% margem líquida</td>
               ${meses.map(m => `<td class="text-right text-[10px] num ${m.margemLiquida<0?'text-brand-coral-900':'text-stone-600'}">${m.margemLiquida.toFixed(1)}%</td>`).join('')}
               <td class="text-right num text-xs font-medium ${total.margemLiquida<0?'text-brand-coral-900':'text-brand-teal-900'}">${total.margemLiquida.toFixed(1)}%</td>
+              <td class="text-right num text-[11px] text-stone-500">—</td>
             </tr>
           </tbody>
         </table>
@@ -4415,17 +4516,164 @@ function renderDRE() {
 
     <p class="text-xs text-stone-500 mt-3">
       <i data-lucide="info" class="w-3 h-3 inline"></i>
-      Receita bruta dos itens = subtotal calculado de cada pedido (sem arredondamento) · Bonificações (±) = diferença do arredondamento aplicado no fechamento do pedido (+ recebida / − concedida) · CPV = insumos + depreciação · MOD das operações é apropriado em <strong>Folha</strong>, junto com contas a pagar categoria "folha" · Utilidades = contas categoria "utilidades" · Despesas operacionais = demais contas a pagar pagas no período.
+      <strong>Realizado</strong>: dados reais do período (pedidos e contas pagas). <strong>Projetado</strong>: valores configurados no módulo 3 (Precificação) multiplicados por 12 meses — útil para comparar o que você planejou vs o que aconteceu. Receita = pedidos confirmados/pagos · CPV = insumos + depreciação · MOD das operações entra em Folha · Despesas operacionais ≈ custos variáveis · Utilidades = contas categoria "utilidades".
     </p>
   `;
 }
 
-function linhaDRE(rotulo, valoresMensais, valorTotal, classes = '') {
+// ----- FLUXO DE CAIXA --------------------------------------------------------
+// Mostra entradas e saídas reais de dinheiro (regime de caixa):
+//  - Entradas: contas a receber pagas no mês
+//  - Saídas: contas a pagar pagas no mês + entradas de NF-e de insumos (compras)
+function calcularFluxoCaixa(anoAlvo) {
+  const meses = Array.from({length:12}, (_, i) => ({
+    mes: i+1, nome: ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'][i],
+    entradasReceber: 0, saidasPagar: 0, comprasInsumos: 0
+  }));
+  // Entradas: contas a receber PAGAS
+  state.contasReceber.forEach(c => {
+    if (c.status !== 'PAGA' || !c.pagoEm) return;
+    const dt = new Date(c.pagoEm);
+    if (dt.getFullYear() !== anoAlvo) return;
+    meses[dt.getMonth()].entradasReceber += Number(c.valor) || 0;
+  });
+  // Saídas: contas a pagar PAGAS
+  state.contasPagar.forEach(c => {
+    if (c.status !== 'PAGA' || !c.pagoEm) return;
+    const dt = new Date(c.pagoEm);
+    if (dt.getFullYear() !== anoAlvo) return;
+    meses[dt.getMonth()].saidasPagar += Number(c.valor) || 0;
+  });
+  // Compras de insumos (lançamentos do tipo ENTRADA em movimentos)
+  state.movimentos.forEach(m => {
+    if (m.tipo !== 'ENTRADA' || !m.data) return;
+    const dt = new Date(m.data);
+    if (dt.getFullYear() !== anoAlvo) return;
+    const valorEntrada = (Number(m.qtd) || 0) * (Number(m.custoUnit) || 0);
+    meses[dt.getMonth()].comprasInsumos += valorEntrada;
+  });
+  meses.forEach(m => {
+    m.totalEntradas = m.entradasReceber;
+    m.totalSaidas = m.saidasPagar + m.comprasInsumos;
+    m.saldo = m.totalEntradas - m.totalSaidas;
+  });
+  // Saldo acumulado
+  let acc = 0;
+  meses.forEach(m => { acc += m.saldo; m.saldoAcumulado = acc; });
+  const total = meses.reduce((acc, m) => ({
+    entradasReceber: acc.entradasReceber + m.entradasReceber,
+    saidasPagar: acc.saidasPagar + m.saidasPagar,
+    comprasInsumos: acc.comprasInsumos + m.comprasInsumos,
+    totalEntradas: acc.totalEntradas + m.totalEntradas,
+    totalSaidas: acc.totalSaidas + m.totalSaidas,
+    saldo: acc.saldo + m.saldo,
+  }), { entradasReceber:0, saidasPagar:0, comprasInsumos:0, totalEntradas:0, totalSaidas:0, saldo:0 });
+  total.saldoAcumulado = total.saldo;
+  return { meses, total };
+}
+
+function renderFluxoCaixa() {
+  const anoAtual = new Date().getFullYear();
+  const anoAlvo = window._caixaAno || anoAtual;
+  const { meses, total } = calcularFluxoCaixa(anoAlvo);
+  const anosDisp = new Set([anoAtual]);
+  state.contasReceber.forEach(c => c.pagoEm && anosDisp.add(new Date(c.pagoEm).getFullYear()));
+  state.contasPagar.forEach(c => c.pagoEm && anosDisp.add(new Date(c.pagoEm).getFullYear()));
+  state.movimentos.forEach(m => m.data && anosDisp.add(new Date(m.data).getFullYear()));
+  const anos = [...anosDisp].sort((a,b) => b-a);
+
+  return `
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <h3 class="font-display text-xl">Fluxo de Caixa (regime de caixa)</h3>
+        <p class="text-xs text-stone-500">Entradas e saídas reais de dinheiro · diferente da DRE que segue o regime de competência</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <label class="text-xs text-stone-600">Ano</label>
+        <select class="input text-xs" style="width:auto" onchange="window._caixaAno=parseInt(this.value); render()">
+          ${anos.map(a => `<option value="${a}" ${a===anoAlvo?'selected':''}>${a}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-4 gap-3 mb-5">
+      <div class="stat-card">
+        <p class="stat-label">Entradas (recebidos)</p>
+        <p class="stat-value num text-brand-teal-900">${fmtBRL(total.totalEntradas)}</p>
+        <p class="stat-hint">contas a receber pagas</p>
+      </div>
+      <div class="stat-card">
+        <p class="stat-label">Saídas (pagos + compras)</p>
+        <p class="stat-value num text-brand-coral-900">${fmtBRL(total.totalSaidas)}</p>
+        <p class="stat-hint">contas a pagar + NF-e insumos</p>
+      </div>
+      <div class="stat-card">
+        <p class="stat-label">Saldo do período</p>
+        <p class="stat-value num ${total.saldo >= 0 ? 'text-brand-teal-900' : 'text-brand-coral-900'}">${fmtBRL(total.saldo)}</p>
+        <p class="stat-hint">${total.saldo >= 0 ? 'caixa positivo' : 'caixa negativo'}</p>
+      </div>
+      <div class="stat-card">
+        <p class="stat-label">Compras de estoque ${anoAlvo}</p>
+        <p class="stat-value num text-stone-700">${fmtBRL(total.comprasInsumos)}</p>
+        <p class="stat-hint">NF-e de insumos recebidas</p>
+      </div>
+    </div>
+
+    <div class="card p-0 overflow-hidden">
+      <div class="overflow-x-auto">
+        <table>
+          <thead>
+            <tr>
+              <th class="sticky left-0 bg-stone-100 z-10">Movimento</th>
+              ${meses.map(m => `<th class="text-right text-[10px]">${m.nome}</th>`).join('')}
+              <th class="text-right bg-brand-purple-50 text-brand-purple-900">Total ${anoAlvo}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="text-brand-teal-900">
+              <td class="text-xs sticky left-0 bg-white z-10">(+) Recebimentos (clientes)</td>
+              ${meses.map(m => `<td class="text-right text-[11px] num">${m.entradasReceber !== 0 ? fmtBRL(m.entradasReceber) : '—'}</td>`).join('')}
+              <td class="text-right num text-xs font-medium">${fmtBRL(total.entradasReceber)}</td>
+            </tr>
+            <tr class="text-brand-coral-900">
+              <td class="text-xs sticky left-0 bg-white z-10">(−) Pagamentos (contas pagas)</td>
+              ${meses.map(m => `<td class="text-right text-[11px] num">${m.saidasPagar !== 0 ? fmtBRL(-m.saidasPagar) : '—'}</td>`).join('')}
+              <td class="text-right num text-xs font-medium">${fmtBRL(-total.saidasPagar)}</td>
+            </tr>
+            <tr class="text-brand-coral-900">
+              <td class="text-xs sticky left-0 bg-white z-10">(−) Compras de insumos (NF-e)</td>
+              ${meses.map(m => `<td class="text-right text-[11px] num">${m.comprasInsumos !== 0 ? fmtBRL(-m.comprasInsumos) : '—'}</td>`).join('')}
+              <td class="text-right num text-xs font-medium">${fmtBRL(-total.comprasInsumos)}</td>
+            </tr>
+            <tr class="font-display font-medium bg-brand-purple-50 text-brand-purple-900">
+              <td class="text-xs sticky left-0 bg-brand-purple-50 z-10">(=) Saldo do mês</td>
+              ${meses.map(m => `<td class="text-right text-[11px] num ${m.saldo<0?'text-brand-coral-900':''}">${m.saldo !== 0 ? fmtBRL(m.saldo) : '—'}</td>`).join('')}
+              <td class="text-right num text-xs font-medium">${fmtBRL(total.saldo)}</td>
+            </tr>
+            <tr class="bg-stone-50">
+              <td class="text-xs sticky left-0 bg-stone-50 z-10">Saldo acumulado</td>
+              ${meses.map(m => `<td class="text-right text-[11px] num ${m.saldoAcumulado<0?'text-brand-coral-900':'text-stone-600'}">${fmtBRL(m.saldoAcumulado)}</td>`).join('')}
+              <td class="text-right num text-xs font-medium">${fmtBRL(total.saldoAcumulado)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <p class="text-xs text-stone-500 mt-3">
+      <i data-lucide="info" class="w-3 h-3 inline"></i>
+      <strong>Fluxo de caixa</strong> mostra dinheiro entrando e saindo no período. Diferente da DRE (que considera o pedido como receita quando confirmado), aqui só conta quando o dinheiro de fato entrou (conta a receber paga) ou saiu (conta a pagar paga + NF-e de insumos). Útil para gestão do caixa diário.
+    </p>
+  `;
+}
+
+function linhaDRE(rotulo, valoresMensais, valorTotal, classes = '', projetado = null) {
   return `
     <tr class="${classes}">
       <td class="text-xs sticky left-0 z-10 ${classes.includes('bg-') ? '' : 'bg-white'}">${rotulo}</td>
       ${valoresMensais.map(v => `<td class="text-right text-[11px] num">${v !== 0 ? fmtBRL(v) : '—'}</td>`).join('')}
-      <td class="text-right num text-xs font-medium ${classes.includes('text-brand-purple-900') ? '' : ''}">${fmtBRL(valorTotal)}</td>
+      <td class="text-right num text-xs font-medium">${fmtBRL(valorTotal)}</td>
+      <td class="text-right num text-[11px] ${projetado != null ? 'text-stone-500' : 'text-stone-300'}">${projetado != null ? fmtBRL(projetado) : '—'}</td>
     </tr>
   `;
 }
