@@ -739,7 +739,7 @@ function confirmarPedido(pedidoId) {
   const vencimento = addDaysISO(baseData, prazoDias);
   state.contasReceber.unshift({
     id: 'cr'+uid(), pedidoId: p.id,
-    descricao: `Pedido #${p.numero} · ${cli.nome}`,
+    descricao: `Pedido #${p.numero} · ${cli?.nome || 'cliente removido'}`,
     valor: p.total, vencimento, status: 'ABERTA'
   });
   logAuditoria('06_pedido', 'CONFIRMADO', p.id, `Pedido #${p.numero} (${tipo === 'ENCOMENDA' ? 'encomenda' : 'pronta entrega'}) confirmado · ${fmtBRL(p.total)}`);
@@ -915,15 +915,21 @@ function renderDashboard() {
           <div class="space-y-2">
             ${entregasHoje.map(p => {
               const cli = state.clientes.find(c => c.id === p.clienteId);
-              const statusCor = {'AGUARDANDO':'bg-stone-100', 'EM_PRODUCAO':'bg-brand-amber-50 text-brand-amber-900', 'PRONTO':'bg-brand-teal-50 text-brand-teal-900', 'EXPEDIDO':'bg-brand-purple-50 text-brand-purple-900', 'ENTREGUE':'bg-brand-green-50 text-brand-green-900'}[p.statusProdutivo];
+              const statusCor = {'AGUARDANDO':'bg-stone-100', 'EM_PRODUCAO':'bg-brand-amber-50 text-brand-amber-900', 'PRONTO':'bg-brand-teal-50 text-brand-teal-900', 'EXPEDIDO':'bg-brand-purple-50 text-brand-purple-900', 'ENTREGUE':'bg-brand-green-50 text-brand-green-900'}[p.statusProdutivo] || 'bg-stone-100';
               return `
                 <div class="flex items-center justify-between py-2 border-b border-stone-100 last:border-0">
                   <div>
-                    <p class="text-sm font-medium">#${p.numero} · ${cli.nome}</p>
-                    <p class="text-xs text-stone-500">${p.itens.map(i => state.produtos.find(pr=>pr.id===i.produtoId).sku + '×' + i.qtd).join(' · ')}</p>
+                    <p class="text-sm font-medium">#${p.numero} · ${cli?.nome || '⚠ cliente removido'}</p>
+                    <p class="text-xs text-stone-500">${(p.itens||[]).map(i => {
+                      const pr = i.produtoId ? state.produtos.find(x=>x.id===i.produtoId) : null;
+                      if (pr) return pr.sku + '×' + i.qtd;
+                      if (i.produtoId) return '⚠×' + i.qtd;
+                      const emb = i.embalagemId ? state.insumos.find(x=>x.id===i.embalagemId) : null;
+                      return (emb?.nome || 'embalagem') + '×' + i.qtd;
+                    }).join(' · ')}</p>
                   </div>
                   <div class="text-right">
-                    <span class="badge ${statusCor}">${p.statusProdutivo.toLowerCase().replace('_',' ')}</span>
+                    <span class="badge ${statusCor}">${(p.statusProdutivo||'').toLowerCase().replace('_',' ')}</span>
                     <p class="text-sm num mt-1">${fmtBRL(p.total)}</p>
                   </div>
                 </div>
@@ -943,7 +949,7 @@ function renderDashboard() {
             return `
               <div>
                 <div class="flex items-center justify-between mb-1">
-                  <p class="text-sm font-medium">OP-${o.numero} · ${prod.nome} (${o.tamanhoLote}un)</p>
+                  <p class="text-sm font-medium">OP-${o.numero} · ${prod?.nome || '⚠ produto removido'} (${o.tamanhoLote}un)</p>
                   <span class="text-xs text-stone-500">${fasesConcluidas}/${o.fases.length} fases</span>
                 </div>
                 <div class="progress">
@@ -960,7 +966,8 @@ function renderDashboard() {
         ${(() => {
           const vendas = {};
           state.pedidos.filter(p => p.statusComercial !== 'RASCUNHO' && p.statusComercial !== 'CANCELADO').forEach(p => {
-            p.itens.forEach(i => {
+            (p.itens||[]).forEach(i => {
+              if (!i.produtoId) return; // itens só de embalagem não entram na curva ABC de produtos
               vendas[i.produtoId] = (vendas[i.produtoId] || 0) + i.qtd * i.preco;
             });
           });
@@ -981,7 +988,7 @@ function renderDashboard() {
                   return `
                     <tr>
                       <td class="num text-stone-500">${idx+1}</td>
-                      <td><strong>${prod.nome}</strong> <span class="text-xs text-stone-500">${prod.sku}</span></td>
+                      <td><strong>${prod?.nome || '⚠ produto removido'}</strong> <span class="text-xs text-stone-500">${prod?.sku || '—'}</span></td>
                       <td class="text-right num">${fmtBRL(val)}</td>
                       <td class="text-right num">${pct.toFixed(1)}%</td>
                       <td class="text-right">
@@ -2072,9 +2079,30 @@ function renderSliderCard(label, key, valor, cor, hint) {
 // MODULE 06 — PEDIDOS
 // ============================================================================
 function renderPedidos() {
+  // Detectar pedidos com referência quebrada (cliente removido OU item com produtoId definido mas produto inexistente)
+  const orfaos = state.pedidos.filter(p => {
+    const semCliente = !state.clientes.find(c => c.id === p.clienteId);
+    const itemSemProd = (p.itens || []).some(it => it.produtoId && !state.produtos.find(x => x.id === it.produtoId));
+    return semCliente || itemSemProd;
+  });
+  const avisoOrfaos = orfaos.length > 0 ? `
+    <div class="card mb-4 border-l-4" style="border-left-color:#E24B4A; background:#FDECEC;">
+      <div class="flex items-start gap-2">
+        <i data-lucide="alert-triangle" class="w-4 h-4 text-brand-coral-900 mt-0.5 shrink-0"></i>
+        <div class="text-xs text-brand-coral-900">
+          <p class="font-medium mb-1">${orfaos.length} pedido(s) com referência(s) quebrada(s) — cliente ou produto foi removido após o cadastro do pedido.</p>
+          <p>Pedidos afetados: ${orfaos.map(p => `<strong>#${p.numero}</strong>`).join(', ')}.
+          Eles continuam listados abaixo com a marcação <span class="font-mono">⚠ removido</span> — abra cada um para revisar e decida cancelar ou recriar.</p>
+        </div>
+      </div>
+    </div>
+  ` : '';
+
   return `
     ${pageHeader('06', 'PEDIDOS', 'Vendas & status',
       `<button class="btn btn-primary" onclick="abrirModalNovoPedido()"><i data-lucide="plus" class="w-3.5 h-3.5"></i> Novo pedido</button>`)}
+
+    ${avisoOrfaos}
 
     <div class="card p-0 overflow-hidden">
       <table>
@@ -2086,24 +2114,36 @@ function renderPedidos() {
         <tbody>
           ${[...state.pedidos].sort((a,b) => b.numero - a.numero).map(p => {
             const cli = state.clientes.find(c => c.id === p.clienteId);
-            const itensTxt = p.itens.map(i => {
-              const prod = state.produtos.find(x => x.id === i.produtoId);
+            const cliNome = cli ? cli.nome : '⚠ cliente removido';
+            const cliTipo = cli ? cli.tipo : '—';
+            const itensTxt = (p.itens || []).map(i => {
+              const prod = i.produtoId ? state.produtos.find(x => x.id === i.produtoId) : null;
               const g = i.gramatura || prod?.pesoLiq || '?';
-              return `${i.qtd}×${g}g ${prod.sku}`;
+              // 3 casos: produto OK, produto removido, item só de embalagem (produtoId null/vazio)
+              let label;
+              if (prod) {
+                label = `${i.qtd}×${g}g ${prod.sku}`;
+              } else if (i.produtoId) {
+                label = `${i.qtd}× ⚠ produto removido`;
+              } else {
+                const emb = i.embalagemId ? state.insumos.find(x => x.id === i.embalagemId) : null;
+                label = `${i.qtd}× ${emb ? emb.nome : 'embalagem'}`;
+              }
+              return label;
             }).join(' · ');
-            const corComercial = {'RASCUNHO':'bg-stone-100','CONFIRMADO':'bg-brand-purple-50 text-brand-purple-900','FATURADO':'bg-brand-amber-50 text-brand-amber-900','PAGO':'bg-brand-teal-50 text-brand-teal-900','CANCELADO':'bg-brand-coral-50 text-brand-coral-900'}[p.statusComercial];
-            const corProd = {'AGUARDANDO':'bg-stone-100','EM_PRODUCAO':'bg-brand-amber-50 text-brand-amber-900','PRONTO':'bg-brand-teal-50 text-brand-teal-900','EXPEDIDO':'bg-brand-purple-50 text-brand-purple-900','ENTREGUE':'bg-brand-green-50 text-brand-green-900','ATRASADO':'bg-brand-coral-50 text-brand-coral-900'}[p.statusProdutivo];
+            const corComercial = {'RASCUNHO':'bg-stone-100','CONFIRMADO':'bg-brand-purple-50 text-brand-purple-900','FATURADO':'bg-brand-amber-50 text-brand-amber-900','PAGO':'bg-brand-teal-50 text-brand-teal-900','CANCELADO':'bg-brand-coral-50 text-brand-coral-900'}[p.statusComercial] || 'bg-stone-100';
+            const corProd = {'AGUARDANDO':'bg-stone-100','EM_PRODUCAO':'bg-brand-amber-50 text-brand-amber-900','PRONTO':'bg-brand-teal-50 text-brand-teal-900','EXPEDIDO':'bg-brand-purple-50 text-brand-purple-900','ENTREGUE':'bg-brand-green-50 text-brand-green-900','ATRASADO':'bg-brand-coral-50 text-brand-coral-900','CANCELADO':'bg-brand-coral-50 text-brand-coral-900'}[p.statusProdutivo] || 'bg-stone-100';
             const tipo = p.tipo || 'ENCOMENDA';
             const corTipo = tipo === 'ENCOMENDA' ? 'bg-brand-purple-50 text-brand-purple-900' : 'bg-brand-teal-50 text-brand-teal-900';
             const opsVinculadas = state.ordens.filter(o => o.pedidoOrigemId === p.id);
             return `
               <tr>
                 <td class="num font-mono text-xs">#${p.numero}${opsVinculadas.length > 0 ? `<span class="block text-[10px] text-stone-500">↳ ${opsVinculadas.map(o => 'OP-'+o.numero).join(', ')}</span>` : ''}</td>
-                <td><strong>${cli.nome}</strong> <span class="text-xs text-stone-500 block">${cli.tipo} · ${p.canal||''}</span></td>
+                <td><strong>${cliNome}</strong> <span class="text-xs text-stone-500 block">${cliTipo} · ${p.canal||''}</span></td>
                 <td><span class="badge ${corTipo} text-[10px]">${tipo === 'ENCOMENDA' ? 'encomenda' : 'pronta entrega'}</span></td>
                 <td class="text-xs">${itensTxt}</td>
-                <td><span class="badge ${corComercial}">${p.statusComercial.toLowerCase()}</span></td>
-                <td><span class="badge ${corProd}">${p.statusProdutivo.toLowerCase().replace('_',' ')}</span></td>
+                <td><span class="badge ${corComercial}">${(p.statusComercial||'').toLowerCase()}</span></td>
+                <td><span class="badge ${corProd}">${(p.statusProdutivo||'').toLowerCase().replace('_',' ')}</span></td>
                 <td class="text-xs">${fmtDate(p.dataEntrega)}</td>
                 <td class="text-right num font-medium">${fmtBRL(p.total)}</td>
                 <td class="text-right">
@@ -2142,7 +2182,7 @@ function abrirDetalhePedido(pedidoId) {
         ${tipo === 'ENCOMENDA' ? 'encomenda' : 'pronta entrega'}
       </span>
     </div>
-    <p class="text-sm text-stone-500 mb-4">${cli.nome} · ${cli.tipo} · ${cli.cidade}</p>
+    <p class="text-sm text-stone-500 mb-4">${cli ? `${cli.nome} · ${cli.tipo} · ${cli.cidade}` : '⚠ cliente removido'}</p>
 
     <table>
       <thead><tr><th>Produto</th><th>Embalagem</th><th class="text-right">Gramatura</th><th class="text-right">Pacotes</th><th class="text-right">Preço un.</th><th class="text-right">Subtotal</th><th class="text-right">Equiv. embal.</th></tr></thead>
@@ -3448,7 +3488,7 @@ function abrirDetalheCliente(id) {
     <table>
       <tbody>${pedidos.map(p => `
         <tr><td>#${p.numero}</td><td class="text-xs">${fmtDate(p.criadoEm)}</td>
-          <td><span class="badge bg-stone-100 text-xs">${p.statusComercial.toLowerCase()}</span></td>
+          <td><span class="badge bg-stone-100 text-xs">${(p.statusComercial||'').toLowerCase()}</span></td>
           <td class="text-right num">${fmtBRL(p.total)}</td></tr>
       `).join('') || '<tr><td colspan="4" class="text-center text-stone-500 text-xs">Sem pedidos.</td></tr>'}</tbody>
     </table>
@@ -3683,10 +3723,10 @@ function renderColunaAgenda(titulo, pedidos, cor) {
             return `
               <div class="border-l-2 border-brand-${cor}-600 pl-3 py-1">
                 <div class="flex items-center justify-between">
-                  <p class="text-sm font-medium">#${p.numero} · ${cli.nome}</p>
+                  <p class="text-sm font-medium">#${p.numero} · ${cli?.nome || '⚠ cliente removido'}</p>
                   <p class="text-xs num">${fmtBRL(p.total)}</p>
                 </div>
-                <p class="text-xs text-stone-500">${p.statusProdutivo.toLowerCase().replace('_',' ')}</p>
+                <p class="text-xs text-stone-500">${(p.statusProdutivo||'').toLowerCase().replace('_',' ')}</p>
               </div>
             `;
           }).join('')}
